@@ -1,9 +1,14 @@
-"""Run the viaduct pipeline over a local video file and write an annotated mp4."""
+"""Worker entry points: batch annotation of a video file, and the live relay.
+
+``python -m drone_worker [batch args]``        process a file, write an mp4
+``python -m drone_worker relay --source ...``  RTSP in, annotated RTMP out
+"""
 
 from __future__ import annotations
 
 import argparse
 import json
+import sys
 import time
 from collections import Counter
 from pathlib import Path
@@ -21,12 +26,14 @@ from algorithm.runtime.factory import (
 )
 from algorithm.runtime.snapshots import record
 from algorithm.runtime.sources import VideoFileSource
+from drone_worker.args import parse_device
 from drone_worker.render import annotate
 
 
 def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Segment the viaduct deck, black out the rest, track vehicles on it.",
+        epilog="For the live relay use: python -m drone_worker relay --source <rtsp> --dest <rtmp>",
     )
     parser.add_argument("--video", type=Path, default=DEFAULT_VIDEO)
     parser.add_argument("--output", type=Path, default=None)
@@ -52,21 +59,20 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     return args
 
 
-def _device(value: str) -> int | str:
-    text = value.strip()
-    if text.lstrip("-").isdigit():
-        return int(text)
-    return text
-
-
 def main(argv: Sequence[str] | None = None) -> int:
-    args = _parse_args(argv)
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    if arguments[:1] == ["relay"]:
+        from drone_worker.relay import main_relay
+
+        return main_relay(arguments[1:])
+
+    args = _parse_args(arguments)
     video = args.video.resolve()
     output = args.output or WORKER_ROOT / "output" / f"{video.stem}_pipeline.mp4"
     output.parent.mkdir(parents=True, exist_ok=True)
 
     settings = default_settings(
-        device=_device(args.device),
+        device=parse_device(args.device),
         segment_imgsz=args.segment_imgsz,
         detect_imgsz=args.detect_imgsz,
         line_imgsz=args.line_imgsz,

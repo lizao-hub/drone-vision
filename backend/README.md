@@ -1,11 +1,11 @@
-# backend — 容器内的控制 API
+# backend — worker 控制 API
 
-浏览器不能直接启停容器，所以这个 FastAPI 服务做“桥”：
+浏览器不能直接启停算法进程/容器，所以这个 FastAPI 服务做“桥”：
 
 | 接口 | 作用 |
 | --- | --- |
-| `POST /api/algorithm/start` | 通过 Docker socket 启动 `drone-worker` |
-| `POST /api/algorithm/stop` | 通过 Docker socket 停止 `drone-worker` |
+| `POST /api/algorithm/start` | 启动 worker（容器或本地进程，见 `WORKER_MODE`） |
+| `POST /api/algorithm/stop` | 停止 worker |
 | `GET /api/status` | worker 状态 + MediaMTX 两条流是否在线 |
 
 推流不归平台管：Windows 侧的 `scripts/push-windows.ps1` 模拟真实设备，
@@ -26,12 +26,34 @@ docker compose up -d --build backend
 1. `network_mode: host`：用 `127.0.0.1` 访问 MediaMTX 的 9997；
 2. `/var/run/docker.sock`：启停 `drone-worker`。
 
+## 本地进程模式（不构建镜像）
+
+`WORKER_MODE=process` 时不再走 Docker socket，而是直接 `subprocess` 启动
+`python -m drone_worker relay ...`，用于在开发机上跑通「前端 + 后端 + 算法」：
+
+```powershell
+$env:WORKER_MODE="process"
+$env:WORKER_PYTHON="D:\Software\Anaconda3\envs\pytorch\python.exe"
+$env:WORKER_WORKDIR="E:\Pycharm\drone-vision\worker"
+$env:WORKER_PYTHONPATH="E:\Pycharm\drone-vision\worker\src"
+$env:WORKER_ARGS="relay --source rtsp://127.0.0.1:8554/drone1 --dest rtmp://127.0.0.1:1935/drone1_yolo --device 0"
+uv run uvicorn app.main:app --host 127.0.0.1 --port 8000
+```
+
+`/api/status` 的 `algorithm.online` 依然取自 MediaMTX 的 `drone1_yolo` 是否在线，
+所以进程模式下的界面行为和容器模式一致。
+
 ## 环境变量
 
 | 变量 | 默认 | 说明 |
 | --- | --- | --- |
 | `MEDIAMTX_API` | `http://127.0.0.1:9997` | MediaMTX 控制 API |
-| `WORKER_CONTAINER` | `drone-worker` | 要控制的容器名 |
+| `WORKER_MODE` | `container` | `container`：Docker socket；`process`：本地子进程 |
+| `WORKER_CONTAINER` | `drone-worker` | 容器模式下要控制的容器名 |
+| `WORKER_PYTHON` | 当前解释器 | 进程模式下的 Python |
+| `WORKER_ARGS` | `relay` | 进程模式下的参数（shell 风格拆分） |
+| `WORKER_WORKDIR` | 当前目录 | 进程模式的工作目录 |
+| `WORKER_PYTHONPATH` | 不设置 | 会拼到子进程的 `PYTHONPATH` 前面 |
 
 ## 依赖
 
@@ -41,7 +63,7 @@ docker compose up -d --build backend
 `requirements.txt` 由 `uv.lock` 导出：
 
 ```powershell
-cd E:\Pycharm\docker-demo2\backend
+cd E:\Pycharm\drone-vision\backend
 uv export --frozen --no-hashes --no-dev --no-emit-project -o requirements.txt
 ```
 

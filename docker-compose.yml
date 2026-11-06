@@ -1,10 +1,15 @@
 name: drone-demo
 
-# 容器链路（当前实现）：
-#   Windows FFmpeg ──RTMP──▶ drone1 ──▶ MediaMTX（浏览器 WebRTC 看原画）
-#   frontend(nginx :8080) ──/api──▶ backend ──Docker socket──▶ worker 容器
-#   worker：读挂载的本地视频，跑「分割→检测→追踪→统计」，写标注 mp4 到 output/
-#   （实时 RTSP 拉流 + RTMP 回推 drone1_yolo 尚未实现，见 README 的「当前状态」）
+# 容器链路：
+#   Windows FFmpeg ──RTMP──▶ drone1 ─┐
+#                                    ├─▶ MediaMTX ──WebRTC──▶ 浏览器
+#   worker：drone1 ──RTSP──▶ 算法 ──RTMP──▶ drone1_yolo ─┘
+#   frontend(nginx :8080) ──/api──▶ backend ──Docker socket──▶ worker 容器（启停）
+#
+# 浏览器播放页：
+#   http://localhost:8080            控制台
+#   http://localhost:8889/drone1     原画
+#   http://localhost:8889/drone1_yolo 检测画
 
 services:
   mediamtx:
@@ -52,15 +57,32 @@ services:
     image: drone-worker:dev
     container_name: drone-worker
     network_mode: host
-    # 批处理入口：视频文件进、标注 mp4 出。实时 RTSP/RTMP 中继还没实现，
-    # 等 relay 入口落地后再换回 ["relay"] 和 DRONE_* 环境变量。
+    restart: unless-stopped
+    depends_on:
+      - mediamtx
+    # 拉 drone1、跑算法、推 drone1_yolo。GPU 需要取消下面 deploy 段的注释
+    # （NVIDIA Container Toolkit）；拿不到 GPU 时 relay 会自动退回 cpu，但 cpu
+    # 太慢、轨迹接不上，只会出画面不出速度，仅作兜底。
+    environment:
+      DRONE_SOURCE: ${DRONE_SOURCE:-rtsp://127.0.0.1:8554/drone1}
+      DRONE_DEST: ${DRONE_DEST:-rtmp://127.0.0.1:1935/drone1_yolo}
+      WORKER_DEVICE: ${WORKER_DEVICE:-0}
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
     volumes:
       - ./worker/models:/app/models:ro
       - ./worker/videos:/app/videos:ro
       - ./worker/output:/app/output
     command:
-      - --video
-      - /app/videos/test_Video1.mp4
-      - --output
-      - /app/output/drone_pipeline.mp4
-    restart: "no"
+      - relay
+      - --source
+      - ${DRONE_SOURCE:-rtsp://127.0.0.1:8554/drone1}
+      - --dest
+      - ${DRONE_DEST:-rtmp://127.0.0.1:1935/drone1_yolo}
+      - --device
+      - ${WORKER_DEVICE:-0}

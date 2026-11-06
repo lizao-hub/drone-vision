@@ -12,8 +12,9 @@ ENV PYTHONUNBUFFERED=1 \
     MPLBACKEND=Agg
 
 # opencv-python (non-headless) links against libGL/libGLib even for file I/O.
+# ffmpeg is the RTMP sink of the live relay (`python -m drone_worker relay`).
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends libgl1 libglib2.0-0 \
+    && apt-get install -y --no-install-recommends libgl1 libglib2.0-0 ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

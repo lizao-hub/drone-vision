@@ -94,6 +94,30 @@ congestion(deck) = 密度先做闸门、再看车速的启发式标签
 
 CLI 每帧打印 `viaduct t=125ms: deck-000001 15.8% n9 22.4km/h moderate, deck-000002 12.7% n4 clear`；视频左下角每块板一行，颜色与板上轮廓、`#N` 标签一致：`#1 15.8% n9 22km/h moderate`、`#2 12.7% n4 -- km/h clear`；没有 deck 统计的帧（速度不可用）左下角留空。JSON 里是 `viaduct_stats[*].decks[*]`（含 `congestion`）。`ViaductUpdate.speed` 里仍带每辆车的 `speed_mps / speed_kmh`，渲染和 JSON 的 `vehicle_speeds` 直接用它。
 
+## 实时 relay（RTSP → RTMP）
+
+```powershell
+cd worker
+$env:PYTHONPATH="E:\Pycharm\drone-vision\worker\src"
+"D:\Software\Anaconda3\envs\pytorch\python.exe" -m drone_worker relay `
+  --source rtsp://127.0.0.1:8554/drone1 `
+  --dest rtmp://127.0.0.1:1935/drone1_yolo `
+  --device 0
+```
+
+链路：`drone1 ──RTSP──▶ 读线程 ──最新帧──▶ pipeline + ViaductRuntime ──annotate──▶ ffmpeg ──RTMP──▶ drone1_yolo`。
+
+- **输入**：RTSP，或本地视频文件（按自身帧率回放、结束后循环，方便没有推流时联调）。
+- **不累积延迟**：读线程只保留最新一帧（`algorithm/runtime/live.py` 的 `LatestFrameQueue`），pipeline 跟不上就丢旧帧，`--log-every` 的输出里有丢帧数。
+- **输出配速**：按 `--out-fps`（默认 10）发送；pipeline 更快时 sleep 到下一个时隙，更慢时不追赶。
+- **推流**：ffmpeg 子进程吃 `bgr24` 原始帧，编 H.264 后以 FLV/RTMP 输出；断流抛 `BrokenPipe` 后自动重建。ffmpeg 解析顺序 `--ffmpeg` → `$FFMPEG_BIN` → `PATH` → `imageio-ffmpeg`。
+- **重连**：RTSP 断开、文件结束都按 1s 间隔重开；时间戳来自单调时钟并保证严格递增（tracker 会拒绝回退的时间）。
+- **分辨率变化**：帧尺寸变了会重建 `VehicleSpeedRuntime` / `ViaductRuntime` 和 ffmpeg sink（尺度是按像素算的，必须跟着变）。
+- **需要 GPU**：relay 是实时链路，pipeline 至少要跑到几 fps 才能让轨迹跨帧接上；CPU 实测约 1 fps，轨迹每帧都断，只会出画面、没有速度（`flow_unavailable`）。`--device 0` 拿不到 GPU 时会自动退回 `cpu` 并在日志里说明。
+- **慢管线参数**：`--track-timeout-ms`（默认 3000，ByteTrack 丢失超时）、`--speed-track-timeout-ms`（默认 3000）、`--scale-window-ms`（默认 5000）、`--min-scale-samples`（默认 5）都比批处理更宽松，专为"处理帧间隔比源帧大"的情况准备；管线足够快时可以不动。
+
+关键参数：`--device cpu|0`（默认 `cpu`）、`--fps`（给 tracker 的名义源帧率，默认 25）、`--out-fps`（默认 10）、`--bitrate`（默认 4M）、`--rtsp-transport tcp|udp`、`--max-frames`（0=常驻，配文件源可做一次性回放）、`--log-every`。
+
 ## 目录
 
 `algorithm` 是自洽的三层包：`domain`（契约 + 状态机）、`perception`（模型适配 + 追踪）、`runtime`（帧源、快照、组合根）。`drone_worker` 只剩入口和可视化，任何新入口（容器实时循环、批量回归）都复用 `algorithm.runtime.factory`，不依赖 CLI 包。
@@ -114,10 +138,13 @@ CLI 每帧打印 `viaduct t=125ms: deck-000001 15.8% n9 22.4km/h moderate, deck-
 | `src/algorithm/perception/pipeline.py` | 唯一编排点：一帧进，一个 `Observation` 出 |
 | `src/algorithm/runtime/frame_packet.py` | `FramePacket`：一帧 + 帧号 + 时间戳 + fps |
 | `src/algorithm/runtime/sources.py` | `VideoFileSource`：本地视频 → `FramePacket`（时间戳严格递增） |
+| `src/algorithm/runtime/live.py` | `LiveSource` + `LatestFrameQueue`：实时取流、只留最新帧 |
+| `src/algorithm/runtime/rtmp_sink.py` | `FfmpegSink`：原始帧 → ffmpeg → FLV/RTMP |
 | `src/algorithm/runtime/snapshots.py` | `record()`：`Observation` + `ViaductUpdate` → JSONL 一行 |
 | `src/algorithm/runtime/factory.py` | 组合根：`PipelineSettings` → 已装配的 pipeline；默认权重/视频路径 |
 | `src/drone_worker/render.py` | 可视化：高架外蓝色半透明、有速度的车框 + 速度、左下角每板一行统计（同色轮廓 + `#N` 锚点） |
-| `src/drone_worker/cli.py` | `python -m drone_worker` 入口 |
+| `src/drone_worker/relay.py` | `python -m drone_worker relay`：RTSP 进、标注 RTMP 出 |
+| `src/drone_worker/cli.py` | 入口：默认批处理，`relay` 子命令转给 `relay.py` |
 
 ## 行为约定
 
@@ -139,4 +166,4 @@ $env:PYTHONPATH="E:\Pycharm\drone-vision\worker\src"
 "D:\Software\Anaconda3\envs\pytorch\python.exe" -m pytest tests -q
 ```
 
-73 个测试覆盖：几何校验、掩码并集/涂黑、pipeline 容错（含车道线分支）与多实例 observation、deck 贪心匹配（顺序交换/漏检保持/新板新 id）、ByteTrack 分标签 id 与时间戳约束、车辆地速 runtime（相对流、静止车为 0、方向、冷启动、冻结帧、尺度中位数）、高架实体 runtime（每板密度与算术平均车速、中心归属、重叠掩码只算一次、速度不可用整帧无效、冻结帧、`valid` 时 `mean=None` 表示该板没车可测、拥挤判定四档边界与可配置阈值）。
+82 个测试覆盖：几何校验、掩码并集/涂黑、pipeline 容错（含车道线分支）与多实例 observation、deck 贪心匹配（顺序交换/漏检保持/新板新 id）、ByteTrack 分标签 id 与时间戳约束、车辆地速 runtime（相对流、静止车为 0、方向、冷启动、冻结帧、尺度中位数）、高架实体 runtime（每板密度与算术平均车速、中心归属、重叠掩码只算一次、速度不可用整帧无效、冻结帧、`valid` 时 `mean=None` 表示该板没车可测、拥挤判定四档边界与可配置阈值）、实时 relay（最新帧队列丢旧、ffmpeg 参数、分辨率校验、relay 参数校验）。

@@ -40,6 +40,7 @@ def default_settings(
     vehicle_confidence: float = 0.30,
     line_confidence: float = 0.30,
     car_width_m: float = 1.95,
+    track_max_lost_ms: int = 1000,
 ) -> PipelineSettings:
     return PipelineSettings(
         viaduct_weight=viaduct_weight,
@@ -53,6 +54,7 @@ def default_settings(
         vehicle_confidence=vehicle_confidence,
         line_confidence=line_confidence,
         car_width_m=car_width_m,
+        track_max_lost_ms=track_max_lost_ms,
     )
 
 
