@@ -1,0 +1,66 @@
+name: drone-demo
+
+# 容器链路（当前实现）：
+#   Windows FFmpeg ──RTMP──▶ drone1 ──▶ MediaMTX（浏览器 WebRTC 看原画）
+#   frontend(nginx :8080) ──/api──▶ backend ──Docker socket──▶ worker 容器
+#   worker：读挂载的本地视频，跑「分割→检测→追踪→统计」，写标注 mp4 到 output/
+#   （实时 RTSP 拉流 + RTMP 回推 drone1_yolo 尚未实现，见 README 的「当前状态」）
+
+services:
+  mediamtx:
+    # 如 1.21.3 拉取失败，可改用 bluenviron/mediamtx:1
+    image: bluenviron/mediamtx:1.21.3
+    container_name: drone-mediamtx
+    network_mode: host
+    restart: unless-stopped
+    volumes:
+      - ./deploy/mediamtx/mediamtx.yml:/mediamtx.yml:ro
+
+  backend:
+    build:
+      context: ./backend
+      network: host
+    image: drone-backend:dev
+    container_name: drone-backend
+    network_mode: host
+    restart: unless-stopped
+    depends_on:
+      - mediamtx
+    volumes:
+      # 允许后端启停 drone-worker；仅限本机演示，注意权限。
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      MEDIAMTX_API: http://127.0.0.1:9997
+      WORKER_CONTAINER: drone-worker
+
+  frontend:
+    build:
+      context: ./frontend
+      network: host
+    image: drone-frontend:dev
+    container_name: drone-frontend
+    network_mode: host
+    restart: unless-stopped
+    depends_on:
+      - backend
+
+  worker:
+    build:
+      context: ./worker
+      # 构建阶段要访问 PyPI 镜像，走 host 网络更稳
+      network: host
+    image: drone-worker:dev
+    container_name: drone-worker
+    network_mode: host
+    # 批处理入口：视频文件进、标注 mp4 出。实时 RTSP/RTMP 中继还没实现，
+    # 等 relay 入口落地后再换回 ["relay"] 和 DRONE_* 环境变量。
+    volumes:
+      - ./worker/models:/app/models:ro
+      - ./worker/videos:/app/videos:ro
+      - ./worker/output:/app/output
+    command:
+      - --video
+      - /app/videos/test_Video1.mp4
+      - --output
+      - /app/output/drone_pipeline.mp4
+    restart: "no"

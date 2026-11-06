@@ -1,0 +1,17 @@
+* text=auto
+
+# 容器内脚本/YAML 必须是 LF，避免 /bin/sh^M 启动失败
+*.sh text eol=lf
+*.cmd text eol=crlf
+Dockerfile text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.md text eol=lf
+
+# 二进制
+*.mp4 binary
+*.mov binary
+*.png binary
+*.jpg binary
+*.pt binary
+*.onnx binary

@@ -1,0 +1,36 @@
+# 本地媒体与模型（体积大，不入库）
+assets/
+worker/models/
+worker/videos/
+recordings/
+
+# 环境配置
+.env
+.env.*
+
+# 日志与缓存
+*.log
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# worker 本地产物
+worker/out/
+worker/output/
+
+# 前端
+node_modules/
+frontend/dist/
+
+# IDE / 本地工具
+.idea/
+.vscode/
+.dsh/
+worker/AGENTS.md
+
+# OS
+Thumbs.db
+.DS_Store
