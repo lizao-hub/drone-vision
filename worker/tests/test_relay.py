@@ -1,10 +1,12 @@
+import threading
+
 import numpy as np
 import pytest
 
-from algorithm.runtime.frame_packet import FramePacket
+from algorithm.engine.packet import FrameGeometryChanged, FramePacket
 from algorithm.runtime.live import LatestFrameQueue, LiveSource
 from algorithm.runtime.rtmp_sink import FfmpegSink, build_ffmpeg_args
-from drone_worker.relay import _parse_args
+from drone_worker.relay import _parse_args, _relay_feed
 
 
 def _packet(index: int) -> FramePacket:
@@ -86,10 +88,55 @@ def test_the_relay_rejects_non_positive_rates():
         _parse_args(["--source", "rtsp://a", "--dest", "rtmp://b", "--out-fps", "-1"])
 
 
-def test_relay_defaults_target_cpu_and_pace_the_output():
+def test_relay_defaults_pace_the_output():
     args = _parse_args(["--source", "rtsp://host/drone1", "--dest", "rtmp://host/out"])
 
-    assert args.device == "cpu"
     assert args.out_fps == 10.0
     assert args.fps == 25.0
     assert args.rtsp_transport == "tcp"
+
+
+class _FrameSource:
+    """The only ``LiveSource`` behaviour the feed needs: ``get``."""
+
+    def __init__(self) -> None:
+        self.sent = 0
+
+    def get(self, timeout=None):
+        self.sent += 1
+        return _packet(self.sent)
+
+
+class _Engine:
+    """A Pipeline stand-in that records its lifecycle."""
+
+    def __init__(self, name: str, *, fail_on_geometry: bool = False) -> None:
+        self.name = name
+        self.fail_on_geometry = fail_on_geometry
+        self.closes = 0
+
+    def run(self, frames):
+        if self.fail_on_geometry:
+            next(iter(frames))  # the frame that crossed the change is dropped
+            raise FrameGeometryChanged("frame size changed")
+        for packet in frames:
+            yield packet.frame, self.name
+
+    def close(self) -> None:
+        self.closes += 1
+
+
+def test_the_relay_rebuilds_the_pipeline_when_the_frame_size_changes():
+    # One loop serves both engines: the serial one never raises, the mp one does.
+    first = _Engine("first", fail_on_geometry=True)
+    second = _Engine("second")
+    built = [first, second]
+
+    feed = _relay_feed(_FrameSource(), threading.Event(), build=lambda: built.pop(0))
+    try:
+        _, observation = next(feed)
+    finally:
+        feed.close()
+
+    assert observation == "second"
+    assert (first.closes, second.closes) == (1, 1)

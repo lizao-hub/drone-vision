@@ -36,7 +36,7 @@ $env:WORKER_MODE="process"
 $env:WORKER_PYTHON="D:\Software\Anaconda3\envs\pytorch\python.exe"
 $env:WORKER_WORKDIR="E:\Pycharm\drone-vision\worker"
 $env:WORKER_PYTHONPATH="E:\Pycharm\drone-vision\worker\src"
-$env:WORKER_ARGS="relay --source rtsp://127.0.0.1:8554/drone1 --dest rtmp://127.0.0.1:1935/drone1_yolo --device 0"
+$env:WORKER_ARGS="relay --source rtsp://127.0.0.1:8554/drone1 --dest rtmp://127.0.0.1:1935/drone1_yolo"
 uv run uvicorn app.main:app --host 127.0.0.1 --port 8000
 ```
 

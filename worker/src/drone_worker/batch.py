@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import statistics
 import time
 from collections import Counter
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Sequence
 
@@ -19,15 +21,18 @@ import cv2
 
 from algorithm.domain.vehicle_speed_runtime import VehicleSpeedRuntime
 from algorithm.domain.viaduct_runtime import ViaductRuntime
-from algorithm.runtime.factory import (
-    DEFAULT_VIDEO,
-    WORKER_ROOT,
-    build_pipeline,
-    default_settings,
-)
+from algorithm.engine.packet import FramePacket
+from algorithm.engine.pipeline import MultiProcessPipeline
+from algorithm.runtime.factory import DEFAULT_VIDEO, WORKER_ROOT
 from algorithm.runtime.snapshots import record
 from algorithm.runtime.sources import VideoFileSource
-from drone_worker.args import parse_device
+from drone_worker.args import (
+    add_model_arguments,
+    add_mp_arguments,
+    build_pipeline_from,
+    pipeline_settings_from,
+    validate_pipeline_arguments,
+)
 from drone_worker.render import annotate
 
 
@@ -37,28 +42,33 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         description="Segment the viaduct deck, black out the rest, track vehicles on it.",
         epilog="For the live relay use: python -m drone_worker relay --source <rtsp> --dest <rtmp>",
     )
+    add_model_arguments(parser)
+    add_mp_arguments(parser)
     parser.add_argument("--video", type=Path, default=DEFAULT_VIDEO)
     parser.add_argument("--output", type=Path, default=None)
-    parser.add_argument("--device", default="0", help="integer GPU index or 'cpu'")
-    parser.add_argument("--segment-imgsz", type=int, default=960)
-    parser.add_argument("--detect-imgsz", type=int, default=640)
-    parser.add_argument("--line-imgsz", type=int, default=640)
-    parser.add_argument("--viaduct-conf", type=float, default=0.25)
-    parser.add_argument("--vehicle-conf", type=float, default=0.30)
-    parser.add_argument("--line-conf", type=float, default=0.30)
     parser.add_argument("--stride", type=int, default=3,
                         help="run inference on every Nth frame; one Observation/JSON line per sampled frame (default: 3)")
-    parser.add_argument("--max-frames", type=int, default=0,
-                        help="stop after N sampled frames")
-    parser.add_argument("--log-every", type=int, default=50)
     parser.add_argument("--json", type=Path, default=None, help="optional JSONL output")
-    parser.add_argument("--car-width-m", type=float, default=1.95,
-                        help="real width of a car, used to scale pixels to metres (default: 1.95)")
     parser.add_argument("--no-video", action="store_true", help="skip the annotated mp4")
     args = parser.parse_args(argv)
     if args.stride < 1:
         parser.error("--stride must be a positive integer")
+    validate_pipeline_arguments(parser, args)
     return args
+
+
+def _packets(source: VideoFileSource) -> Iterator[FramePacket]:
+    """The source as the engines consume it: one packet per sampled frame."""
+    while True:
+        packet = source.read()
+        if packet is None:
+            return
+        yield packet
+
+
+def _observations(source: VideoFileSource, pipeline: MultiProcessPipeline):
+    """Yield ``(frame, observation)``; the engine decides how far it reads ahead."""
+    yield from pipeline.run(_packets(source))
 
 
 def main_batch(argv: Sequence[str] | None = None) -> int:
@@ -67,20 +77,15 @@ def main_batch(argv: Sequence[str] | None = None) -> int:
     output = args.output or WORKER_ROOT / "output" / f"{video.stem}_pipeline.mp4"
     output.parent.mkdir(parents=True, exist_ok=True)
 
-    settings = default_settings(
-        device=parse_device(args.device),
-        segment_imgsz=args.segment_imgsz,
-        detect_imgsz=args.detect_imgsz,
-        line_imgsz=args.line_imgsz,
-        viaduct_confidence=args.viaduct_conf,
-        vehicle_confidence=args.vehicle_conf,
-        line_confidence=args.line_conf,
-        car_width_m=args.car_width_m,
-    )
+    settings = pipeline_settings_from(args)
 
     source = VideoFileSource(video, stride=args.stride)
     source.open()
-    pipeline = build_pipeline(settings, fps=source.fps)
+    pipeline = build_pipeline_from(args, settings, fps=source.fps)
+    # Load the models (and warm them) before the clock starts, so ``wall``/``fps``
+    # measure the stream and not the one-off start-up: this allocates the shared
+    # memory and starts the three workers at the source geometry.
+    pipeline.warm_up(source.height, source.width)
     viaduct_runtime = ViaductRuntime(
         speed=VehicleSpeedRuntime(
             frame_width=source.width,
@@ -101,7 +106,7 @@ def main_batch(argv: Sequence[str] | None = None) -> int:
 
     processed = 0
     valid = 0
-    total_ms = 0.0
+    processing_samples: list[float] = []
     track_ids: set[str] = set()
     line_track_ids: set[str] = set()
     labels: Counter[str] = Counter()
@@ -123,17 +128,9 @@ def main_batch(argv: Sequence[str] | None = None) -> int:
     started_at = time.perf_counter()
 
     try:
-        while True:
-            packet = source.read()
-            if packet is None:
-                break
-            observation = pipeline.process(
-                packet.frame,
-                packet.timestamp_ms,
-                packet.frame_index,
-            )
+        for frame, observation in _observations(source, pipeline):
             processed += 1
-            total_ms += observation.diagnostics.processing_ms
+            processing_samples.append(observation.diagnostics.processing_ms)
             valid += int(observation.frame_valid)
             for track in observation.vehicle_tracks:
                 track_ids.add(track.track_id)
@@ -181,7 +178,7 @@ def main_batch(argv: Sequence[str] | None = None) -> int:
             if writer is not None:
                 writer.write(
                     annotate(
-                        packet.frame,
+                        frame,
                         observation,
                         viaduct=viaduct,
                     )
@@ -205,16 +202,20 @@ def main_batch(argv: Sequence[str] | None = None) -> int:
                 )
     finally:
         source.close()
+        pipeline.close()
         if writer is not None:
             writer.release()
         if json_stream is not None:
             json_stream.close()
 
     elapsed = time.perf_counter() - started_at
-    average_ms = total_ms / processed if processed else 0.0
+    # Median, not mean: the first frame pays cuDNN/cuBLAS autotuning and would
+    # otherwise dominate the average of a short clip (a 30-frame clip can look
+    # twice as slow as the steady state).
+    median_ms = statistics.median(processing_samples) if processing_samples else 0.0
     throughput = processed / elapsed if elapsed else 0.0
     print(
-        f"frames={processed} (1/{args.stride}) valid={valid} avg_proc={average_ms:.1f}ms "
+        f"frames={processed} (1/{args.stride}) valid={valid} median_proc={median_ms:.1f}ms "
         f"wall={elapsed:.1f}s fps={throughput:.1f}"
     )
     if track_ids:

@@ -41,6 +41,8 @@ $env:PYTHONPATH="E:\Pycharm\drone-vision\worker\src"
 
 输出 `worker/output/<视频名>_pipeline.mp4`；加 `--json output/<视频名>.jsonl` 可另存每帧一条 Observation。参数、数据结构与各 runtime 的判定规则见 [worker/README.md](worker/README.md)。
 
+整条流水线是三个 worker 进程 + 一个父进程，三段模型各占一张卡：默认分割用 0 号卡、车辆检测 1、车道线 2，`--segment-gpus 0,4 --vehicle-gpu 5 --line-gpu 6` 可以自己排布。1080p、RTX 4080、分割双卡实测约 71 fps（端到端批处理约 62 fps），见 [worker/README.md](worker/README.md) 的「多进程多卡」一节。
+
 ## 测试
 
 ```powershell
@@ -49,7 +51,7 @@ $env:PYTHONPATH="E:\Pycharm\drone-vision\worker\src"
 "D:\Software\Anaconda3\envs\pytorch\python.exe" -m pytest tests -q
 ```
 
-82 个测试，纯 CPU，不需要权重和视频。
+125 个测试，纯 CPU，不需要权重和视频。
 
 ## 一键跑通（Docker）
 
@@ -78,13 +80,14 @@ worker 容器的行为：
 
 ```yaml
 command: relay --source ${DRONE_SOURCE:-rtsp://127.0.0.1:8554/drone1} \
-               --dest   ${DRONE_DEST:-rtmp://127.0.0.1:1935/drone1_yolo} \
-               --device ${WORKER_DEVICE:-0}
+               --dest   ${DRONE_DEST:-rtmp://127.0.0.1:1935/drone1_yolo}
 ```
 
-实时链路需要 GPU：pipeline 得跑到几 fps，轨迹才能跨帧接上。容器里用 GPU 要按 `docker-compose.yml` 的注释打开 `deploy.resources.reservations.devices`（需 NVIDIA Container Toolkit）；拿不到 GPU 时 relay 会自动退回 CPU，但 CPU 实测约 1 fps，只出画面不出速度，仅作兜底。
+实时链路需要 GPU：pipeline 得跑到几 fps，轨迹才能跨帧接上，三个 worker 各自钉一张卡，没有 CPU 回退。容器里用 GPU 要按 `docker-compose.yml` 的注释打开 `deploy.resources.reservations.devices`（需 NVIDIA Container Toolkit）。
 
 ## 不构建，直接在本机联调
+
+服务器上（没有 sudo 也能跑）可以用两个脚本一键起停：`scripts/serve-server.sh`（MediaMTX + 模拟推流 + backend 进程模式）和 `scripts/serve-windows.ps1`（SSH 隧道 + 前端 dev）。下面是手工步骤。
 
 只用一个 MediaMTX 容器（镜像，不构建），worker / backend / frontend 全部原生跑：
 
@@ -98,16 +101,17 @@ cd /path/to/drone-vision && docker compose up -d mediamtx
 powershell -ExecutionPolicy Bypass -File scripts\push-windows.ps1
 
 # 3) Windows：后端（进程模式，直接拉起 worker relay）
-cd E:\Pycharm\drone-vision\backend
+cd E:\RemotePycharmProjects\drone-vision\backend
 $env:WORKER_MODE="process"
 $env:WORKER_PYTHON="D:\Software\Anaconda3\envs\pytorch\python.exe"
-$env:WORKER_WORKDIR="E:\Pycharm\drone-vision\worker"
-$env:WORKER_PYTHONPATH="E:\Pycharm\drone-vision\worker\src"
-$env:WORKER_ARGS="relay --source rtsp://127.0.0.1:8554/drone1 --dest rtmp://127.0.0.1:1935/drone1_yolo --device 0"
+$env:WORKER_WORKDIR="E:\RemotePycharmProjects\drone-vision\worker"
+$env:WORKER_PYTHONPATH="E:\RemotePycharmProjects\drone-vision\worker\src"
+# 进程模式执行的是 <WORKER_PYTHON> <WORKER_ARGS...>，必须带 "-m drone_worker"
+$env:WORKER_ARGS="-m drone_worker relay --source rtsp://127.0.0.1:8554/drone1 --dest rtmp://127.0.0.1:1935/drone1_yolo"
 uv run uvicorn app.main:app --host 127.0.0.1 --port 8000
 
 # 4) Windows：前端 dev（/api 代理到 8000，WHEP 直连 8889）
-cd E:\Pycharm\drone-vision\frontend
+cd E:\RemotePycharmProjects\drone-vision\frontend
 npm install     # 已有 node_modules 可跳过
 npm run dev
 ```
@@ -120,7 +124,7 @@ npm run dev
 cd E:\Pycharm\drone-vision\worker
 $env:PYTHONPATH="E:\Pycharm\drone-vision\worker\src"
 "D:\Software\Anaconda3\envs\pytorch\python.exe" -m drone_worker relay `
-  --source rtsp://127.0.0.1:8554/drone1 --dest rtmp://127.0.0.1:1935/drone1_yolo --device 0
+  --source rtsp://127.0.0.1:8554/drone1 --dest rtmp://127.0.0.1:1935/drone1_yolo
 ```
 
 检测流随后可在 <http://127.0.0.1:8889/drone1_yolo> 直接播放（也可以把 `--source` 换成本地 mp4，relay 会按帧率回放并循环）。

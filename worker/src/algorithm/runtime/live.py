@@ -18,7 +18,7 @@ from time import monotonic, monotonic_ns, sleep
 import cv2
 import numpy as np
 
-from algorithm.runtime.frame_packet import FramePacket
+from algorithm.engine.packet import FramePacket
 
 DEFAULT_FPS = 25.0
 REOPEN_DELAY_S = 1.0

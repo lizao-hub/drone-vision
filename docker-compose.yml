@@ -60,20 +60,21 @@ services:
     restart: unless-stopped
     depends_on:
       - mediamtx
-    # 拉 drone1、跑算法、推 drone1_yolo。GPU 需要取消下面 deploy 段的注释
-    # （NVIDIA Container Toolkit）；拿不到 GPU 时 relay 会自动退回 cpu，但 cpu
-    # 太慢、轨迹接不上，只会出画面不出速度，仅作兜底。
+    # 拉 drone1、跑算法、推 drone1_yolo。GPU 已启用（需服务器安装
+    # NVIDIA Container Toolkit）；三个 worker 各自钉一张卡，没有 CPU 回退。
     environment:
       DRONE_SOURCE: ${DRONE_SOURCE:-rtsp://127.0.0.1:8554/drone1}
       DRONE_DEST: ${DRONE_DEST:-rtmp://127.0.0.1:1935/drone1_yolo}
-      WORKER_DEVICE: ${WORKER_DEVICE:-0}
-    # deploy:
-    #   resources:
-    #     reservations:
-    #       devices:
-    #         - driver: nvidia
-    #           count: all
-    #           capabilities: [gpu]
+    # 帧缓冲走 /dev/shm（1080p、window=4 约 315MB），容器默认只有
+    # 64MB，不放开会在创建共享内存时 ENOSPC。
+    shm_size: "512mb"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
     volumes:
       - ./worker/models:/app/models:ro
       - ./worker/videos:/app/videos:ro
@@ -84,5 +85,3 @@ services:
       - ${DRONE_SOURCE:-rtsp://127.0.0.1:8554/drone1}
       - --dest
       - ${DRONE_DEST:-rtmp://127.0.0.1:1935/drone1_yolo}
-      - --device
-      - ${WORKER_DEVICE:-0}

@@ -6,7 +6,7 @@ from pathlib import Path
 
 import cv2
 
-from algorithm.runtime.frame_packet import FramePacket
+from algorithm.engine.packet import FramePacket
 
 
 class VideoFileSource:

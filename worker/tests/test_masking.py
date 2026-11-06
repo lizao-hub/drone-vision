@@ -3,7 +3,7 @@ import pytest
 
 from algorithm.domain.geometry import Box, Mask
 from algorithm.domain.observations import DetectedObject
-from algorithm.perception.masking import apply_mask, union_mask
+from algorithm.perception.masking import apply_mask, deck_frame, union_mask
 
 
 def _detection(mask: np.ndarray, confidence: float = 0.9) -> DetectedObject:
@@ -53,6 +53,31 @@ def test_union_requires_a_mask_on_every_instance():
     )
     with pytest.raises(ValueError):
         union_mask((without_mask,), height=4, width=6)
+
+
+def test_deck_frame_returns_the_masked_frame_and_whether_the_deck_is_empty():
+    frame = np.full((4, 6, 3), 180, dtype=np.uint8)
+    deck = np.zeros((4, 6), dtype=np.bool_)
+    deck[:, :3] = True
+
+    masked, empty = deck_frame(frame, (_detection(deck),))
+
+    assert not empty
+    assert (masked[:, :3] == 180).all()
+    assert (masked[:, 3:] == 0).all()
+
+    # "Empty" means the union covers no pixel, not that the tuple is empty: an
+    # instance with a blank mask still tells the caller to skip both detectors.
+    blank = DetectedObject(
+        label="viaduct",
+        confidence=0.9,
+        box=Box(0.0, 0.1, 0.2, 0.2),
+        mask=Mask(np.zeros((4, 6), dtype=np.bool_)),
+    )
+    masked, empty = deck_frame(frame, (blank,))
+
+    assert empty
+    assert not masked.any()
 
 
 def test_apply_mask_blacks_out_everything_off_the_deck():

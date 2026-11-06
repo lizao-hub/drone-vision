@@ -46,6 +46,33 @@ def union_mask(
     return Mask(combined)
 
 
+def deck_frame(
+    frame: np.ndarray,
+    segmentations: Sequence[DetectedObject],
+    *,
+    out: np.ndarray | None = None,
+) -> tuple[np.ndarray, bool]:
+    """Black out everything outside this frame's deck union.
+
+    The one implementation of "derive the deck region, keep only the deck": the
+    segment worker of the engine calls it, so what gets blacked out and what the
+    detectors see cannot drift apart.  The union itself is not returned: the
+    only thing the caller needs from it is whether it covered a pixel, which is
+    exactly what makes it skip both detectors.
+
+    ``out`` reuses a caller-owned buffer across frames (the result must not
+    outlive the current frame); a new one is allocated when the frame geometry
+    changed.  Returns the masked frame and whether the deck was empty.
+    """
+    if frame.ndim != 3:
+        raise ValueError("frame must be an H x W x C array")
+    height, width = int(frame.shape[0]), int(frame.shape[1])
+    if out is not None and (out.shape != frame.shape or out.dtype != frame.dtype):
+        out = None
+    union = union_mask(segmentations, height=height, width=width)
+    return apply_mask(frame, union, out=out), not union.data.any()
+
+
 def apply_mask(
     frame: np.ndarray, mask: Mask, *, out: np.ndarray | None = None
 ) -> np.ndarray:

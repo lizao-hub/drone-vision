@@ -8,10 +8,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from algorithm.config import PipelineSettings
-from algorithm.perception.detect_models import DetectionAdapter
-from algorithm.perception.pipeline import ObservationPipeline
-from algorithm.perception.segment_model import ViaductSegmentAdapter
+from algorithm.config import MpPipelineSettings, PipelineSettings
+from algorithm.engine.pipeline import MultiProcessPipeline
+from algorithm.perception.assembly import ObservationAssembler
 from algorithm.perception.tracking import (
     LINE_LABELS,
     VEHICLE_LABELS,
@@ -58,25 +57,11 @@ def default_settings(
     )
 
 
-def build_pipeline(settings: PipelineSettings, *, fps: float) -> ObservationPipeline:
-    """Wire adapters, trackers and pipeline; the tracker buffers need the source fps."""
+def build_assembler(settings: PipelineSettings, *, fps: float) -> ObservationAssembler:
+    """Trackers only: no model handle, so no GPU is touched in this process."""
     if fps <= 0:
         raise ValueError("fps must be positive")
-    vehicle_detection = DetectionAdapter(
-        settings.vehicle_weight,
-        device=settings.device,
-        imgsz=settings.detect_imgsz,
-        confidence=settings.vehicle_confidence,
-    )
-    line_detection = DetectionAdapter(
-        settings.line_weight,
-        device=settings.device,
-        imgsz=settings.line_imgsz,
-        confidence=settings.line_confidence,
-        # A swapped checkpoint must fail at wiring time, not silently track junk.
-        expected_labels=(settings.line_label,),
-    )
-    tracker = ByteTracker(
+    vehicle_tracker = ByteTracker(
         # Fixed by design: identities are only issued for bus/car/truck.
         labels=VEHICLE_LABELS,
         detection_threshold=settings.vehicle_confidence,
@@ -95,18 +80,27 @@ def build_pipeline(settings: PipelineSettings, *, fps: float) -> ObservationPipe
         fps=fps,
         match_threshold=settings.track_match_threshold,
     )
-    return ObservationPipeline(
-        viaduct_segment=ViaductSegmentAdapter(
-            settings.viaduct_weight,
-            device=settings.device,
-            imgsz=settings.segment_imgsz,
-            confidence=settings.viaduct_confidence,
-            expected_label=settings.viaduct_label,
-        ),
-        vehicle_detection=vehicle_detection,
-        vehicle_tracker=tracker,
-        line_detection=line_detection,
+    return ObservationAssembler(
+        vehicle_tracker=vehicle_tracker,
         line_tracker=line_tracker,
         viaduct_tracker=ViaductTracker(),
-        mask_min_confidence=settings.mask_min_confidence,
+    )
+
+
+def build_pipeline(
+    settings: PipelineSettings,
+    mp_settings: MpPipelineSettings,
+    *,
+    fps: float,
+) -> MultiProcessPipeline:
+    """Wire the multi-process pipeline; the parent loads no model and runs no CUDA.
+
+    The assembler is built here and handed in, so the engine never imports this
+    module: the composition root depends on the engine, not the other way round.
+    """
+    return MultiProcessPipeline(
+        settings,
+        mp_settings,
+        fps=fps,
+        assembler=build_assembler(settings, fps=fps),
     )
