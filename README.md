@@ -23,7 +23,6 @@ backend/               控制 API（FastAPI + Docker SDK / 本地进程模式）
 frontend/              Vue 3 + Vite + nginx
 deploy/mediamtx/       MediaMTX 配置
 docker-compose.yml     本地演示平台编排
-docs/                  需求文档
 ```
 
 ## 本地跑 worker
