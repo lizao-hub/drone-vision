@@ -169,4 +169,4 @@ $env:PYTHONPATH="E:\Pycharm\drone-vision\worker\src"
 "D:\Software\Anaconda3\envs\pytorch\python.exe" -m pytest tests -q
 ```
 
-82 个测试覆盖：几何校验、掩码并集/涂黑、pipeline 容错（含车道线分支）与多实例 observation、deck 贪心匹配（顺序交换/漏检保持/新板新 id）、ByteTrack 分标签 id 与时间戳约束、车辆地速 runtime（相对流、静止车为 0、方向、冷启动、冻结帧、尺度中位数）、高架实体 runtime（每板密度与算术平均车速、中心归属、重叠掩码只算一次、速度不可用整帧无效、冻结帧、`valid` 时 `mean=None` 表示该板没车可测、拥挤判定四档边界与可配置阈值）、实时 relay（最新帧队列丢旧、ffmpeg 参数、分辨率校验、relay 参数校验）。
+86 个测试覆盖：几何校验、掩码并集/涂黑（含复用缓冲）、pipeline 容错（含车道线分支）与多实例 observation、deck 贪心匹配（顺序交换/漏检保持/新板新 id/大掩码降采样）、ByteTrack 分标签 id 与时间戳约束、车辆地速 runtime（相对流、静止车为 0、方向、冷启动、冻结帧、尺度中位数）、高架实体 runtime（每板密度与算术平均车速、中心归属、重叠掩码只算一次、速度不可用整帧无效、冻结帧、`valid` 时 `mean=None` 表示该板没车可测、拥挤判定四档边界与可配置阈值）、实时 relay（最新帧队列丢旧、ffmpeg 参数、分辨率校验、relay 参数校验）。

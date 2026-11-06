@@ -70,6 +70,9 @@ class ObservationPipeline:
         self.line_tracker = line_tracker
         self.viaduct_tracker = viaduct_tracker
         self.mask_min_confidence = mask_min_confidence
+        # Reused blackout buffer: the masked frame only lives for this call, and
+        # allocating 6 MB per frame is measurable at 1080p.
+        self._masked: np.ndarray | None = None
 
     def process(
         self,
@@ -150,7 +153,13 @@ class ObservationPipeline:
             )
 
         # Step 4: blacken everything off the deck, then detect on that image.
-        masked = apply_mask(frame, mask)
+        if (
+            self._masked is None
+            or self._masked.shape != frame.shape
+            or self._masked.dtype != frame.dtype
+        ):
+            self._masked = np.empty_like(frame)
+        masked = apply_mask(frame, mask, out=self._masked)
         detect_started = perf_counter()
         try:
             vehicle = self.vehicle_detection.predict(masked)

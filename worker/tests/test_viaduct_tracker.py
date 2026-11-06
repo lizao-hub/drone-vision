@@ -111,3 +111,39 @@ def test_invalid_settings_are_rejected():
         ViaductTracker(match_threshold=0.0)
     with pytest.raises(ValueError):
         ViaductTracker(max_gap_ms=0)
+
+
+# -- large masks take the strided IoU path ---------------------------------
+def _large_mask(columns: slice) -> np.ndarray:
+    mask = np.zeros((256, 256), dtype=np.bool_)
+    mask[:, columns] = True
+    return mask
+
+
+def _large_deck(mask: np.ndarray) -> DetectedObject:
+    rows = np.flatnonzero(mask.any(axis=1))
+    columns = np.flatnonzero(mask.any(axis=0))
+    height, width = mask.shape
+    box = Box(
+        columns[0] / width,
+        rows[0] / height,
+        (columns[-1] + 1) / width,
+        (rows[-1] + 1) / height,
+    )
+    return DetectedObject(label="viaduct", confidence=0.9, box=box, mask=Mask(mask))
+
+
+def test_a_large_mask_keeps_its_id_across_frames():
+    tracker = ViaductTracker()
+    [before] = tracker.update(0, (_large_deck(_large_mask(slice(0, 120))),))
+    [after] = tracker.update(125, (_large_deck(_large_mask(slice(2, 118))),))
+
+    assert before.track_id == after.track_id
+
+
+def test_large_masks_that_do_not_overlap_get_a_new_id():
+    tracker = ViaductTracker()
+    tracker.update(0, (_large_deck(_large_mask(slice(0, 120))),))
+    [other] = tracker.update(125, (_large_deck(_large_mask(slice(130, 250))),))
+
+    assert other.track_id == "deck-000002"

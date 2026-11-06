@@ -101,9 +101,20 @@ class ViaductTracker:
         self._decks = states
 
 
+_IOU_STRIDE = 4
+_IOU_MIN_SIDE = 128
+
+
 def _mask_iou(first: np.ndarray, second: np.ndarray) -> float:
+    # Full-resolution comparison is memory-bandwidth bound at 1080p (2 MB per
+    # mask, four whole-array passes per pair).  Deck masks are large solid
+    # regions, so a strided view is plenty for the 0.3 threshold; small masks
+    # (unit tests, odd inputs) are compared exactly.
     if first.shape != second.shape:
         return 0.0
+    if min(first.shape) >= _IOU_MIN_SIDE:
+        first = first[::_IOU_STRIDE, ::_IOU_STRIDE]
+        second = second[::_IOU_STRIDE, ::_IOU_STRIDE]
     intersection = int(np.count_nonzero(first & second))
     if not intersection:
         return 0.0

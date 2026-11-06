@@ -62,3 +62,23 @@ def test_apply_mask_blacks_out_everything_off_the_deck():
     assert (masked[mask.data] == 255).all()
     assert (masked[~mask.data] == 0).all()
     assert (frame == 255).all()
+
+
+def test_apply_mask_fills_a_reused_buffer_in_place():
+    mask = Mask(np.array([[True, False], [False, False]], dtype=np.bool_))
+    frame = np.full((2, 2, 3), 200, dtype=np.uint8)
+    buffer = np.empty_like(frame)
+
+    masked = apply_mask(frame, mask, out=buffer)
+
+    assert masked is buffer
+    assert int(masked[0, 0, 0]) == 200
+    assert int(masked[1, 1, 2]) == 0
+    assert int(frame[1, 1, 2]) == 200  # the source frame is never touched
+
+
+def test_apply_mask_rejects_a_buffer_of_the_wrong_shape():
+    mask = Mask(np.ones((2, 2), dtype=np.bool_))
+    frame = np.zeros((2, 2, 3), dtype=np.uint8)
+    with pytest.raises(ValueError):
+        apply_mask(frame, mask, out=np.empty((3, 3, 3), dtype=np.uint8))
