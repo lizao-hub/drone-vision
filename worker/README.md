@@ -31,7 +31,7 @@ cd E:\Pycharm\drone-vision\worker
 
 ```text
 frame
-  → 分割(viaduct)                      # retina_masks=True，直接得到原帧尺寸掩码
+  → 分割(viaduct)                      # retina_masks=True，FP16，直接得到原帧尺寸掩码
   → Observation.viaduct: tuple[DetectedObject, ...]   # 每个实例独立 box + mask
   → 贪心掩码 IoU 匹配上一帧              # 实例顺序不稳定，靠这个给 deck 稳定 id
   → Observation.viaduct_tracks: tuple[TrackedObject, ...]   # track_id + box + mask
@@ -160,7 +160,8 @@ $env:PYTHONPATH="E:\Pycharm\drone-vision\worker\src"
 - 检测只有一个置信度，因此 ByteTrack 的低分关联阶段实际为空。
 - 采样：只有第 0、3、6… 帧会调用一次 `pipeline.process`，因此 Observation 数量、JSONL 行数都等于 `源帧数 / stride`；`timestamp_ms` 仍是源视频时间（间隔约 125ms @24fps），轨迹按这个时间过期。
 - 采样间隔变大后车辆位移也大，ByteTrack 的 IoU/卡尔曼关联会变弱：`stride=5`（208ms）时快速车道的车位移约 30px，相邻采样 IoU 只有 0.1~0.2，低于 ByteTrack 未确认轨迹的 0.3 门限，会一直“新建未确认轨迹→丢弃”，表现为检测到了但没有轨迹；`stride=3`（125ms）可以正常确认。
-- 两处 `predict` 都固定 `rect=False`：方图 letterbox 到 `imgsz`，不允许退化成步幅倍数的小张量。
+- 三处 `predict` 都固定 `rect=True`：按步幅取最小矩形 letterbox（1080p 16:9 下分割是 960×544、检测是 640×384），相比方图少约 40% 的填充像素；框坐标仍归一化到原图，retina 掩码也由 SDK 映射回原帧。
+- 分割模型固定 `quantize=16`（FP16）：它是三模型里最慢的一段，也是唯一能吃满 tensor core 的模型；两个 640 检测模型保持 FP32。Ultralytics 在 `--device cpu` 上会自动回退到 FP32。
 
 ## 测试
 

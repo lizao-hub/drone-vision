@@ -69,9 +69,10 @@ class DetectionAdapter:
             conf=self._confidence,
             device=self._device,
             imgsz=self._imgsz,
-            # Square letterbox only: rect=True would pad to the nearest stride
-            # multiple, producing a tensor smaller than imgsz.
-            rect=False,
+            # Minimal-rect letterboxing: a 1080p 16:9 frame becomes 640x384
+            # instead of 640x640, dropping ~40% of the padded pixels.  Boxes stay
+            # normalized to the source frame, so coordinates are unaffected.
+            rect=True,
             verbose=False,
         )
         if not results:

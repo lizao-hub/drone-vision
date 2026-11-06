@@ -62,9 +62,14 @@ class ViaductSegmentAdapter:
             device=self._device,
             imgsz=self._imgsz,
             retina_masks=True,
-            # Keep square letterboxing: no minimal-rect padding, so the input
-            # tensor always reaches imgsz instead of shrinking to a stride multiple.
-            rect=False,
+            # FP16 is hardcoded for the segmenter: it is the slowest stage and
+            # the only model with enough work to feed the tensor cores (the two
+            # 640 detectors are latency-bound).  Ultralytics forces FP32 on CPU.
+            quantize=16,
+            # Minimal-rect letterboxing: a 1080p 16:9 frame becomes 960x544
+            # instead of 960x960, dropping ~40% of the padded pixels.  Boxes and
+            # retina masks are mapped back to the source frame by the SDK.
+            rect=True,
             verbose=False,
         )
         if not results:
