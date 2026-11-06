@@ -226,7 +226,7 @@ python -m drone_worker relay --source rtsp://127.0.0.1:8554/drone1 `
 - **`processing_ms` 的语义**：它是"这一帧的关键路径工作量"
   （`分割 + max(车辆, 车道线) + 组装`），不是排队延迟，所以它可能大于
   1000/fps——流水线是并行的，两者本来就不是一回事。真实吞吐看 fps。
-- **首帧 autotune**：`batch` 在计时之前显式 `pipeline.warm_up(height, width)`
+- **首帧 autotune**：`batch` 在计时之前显式 `pipeline.start(height, width)`
   （只传几何，内容无关），worker 启动时各跑一次空帧前向（cuDNN autotune 约 2s），
   所以 `wall/fps` 和 `median_proc` 都不受影响。
 - **启动 ~25s**：几乎全部是 `import ultralytics`（拉 torch）和三个 worker 的模型加载。
@@ -261,7 +261,7 @@ python scripts\count_instances.py --video ..\..\1080p.mp4 --frames 440 --stride 
 | `src/algorithm/engine/__init__.py` | 包说明：三个 worker + 一个父进程，纯执行壳（不做任何"这意味着什么"的判定） |
 | `src/algorithm/engine/packet.py` | `FramePacket`：一帧 + 帧号 + 时间戳 + fps，引擎的输入；`FrameGeometryChanged`：换了分辨率的帧（relay 据此重建） |
 | `src/algorithm/engine/shared.py` | 共享内存槽（原图/遮黑图/掩码）与进程间消息 |
-| `src/algorithm/engine/workers.py` | 分割/车辆/车道线 worker，各自钉一张卡 |
+| `src/algorithm/engine/workers.py` | `WorkerSpec` + `run_worker`：三个角色的入参统一成一个 spec，一进程一卡 |
 | `src/algorithm/engine/pipeline.py` | `MultiProcessPipeline`：submit/result/run、按帧号组装、背压与关停；tracker 由组合根注入（父进程不 import factory） |
 | `src/algorithm/perception/raw.py` | SDK 无关的辅助函数（张量转换/权重校验） |
 | `src/algorithm/perception/segment_model.py` | `ViaductSegmentAdapter`：YOLO(seg) → 原始掩码 |
@@ -304,4 +304,4 @@ $env:PYTHONPATH="E:\Pycharm\drone-vision\worker\src"
 "D:\Software\Anaconda3\envs\pytorch\python.exe" -m pytest tests -q
 ```
 
-128 个测试覆盖：几何校验、掩码并集/涂黑（含复用缓冲与"空桥面"判定）、`StageResult` 携带失效原因而不是布尔标志、`ObservationAssembler` 的六条失效优先级（分割/车辆/车道线适配器错误、两条 tracker 错误、空桥面跳过检测）、deck 贪心匹配（顺序交换/漏检保持/新板新 id/大掩码降采样）、ByteTrack 分标签 id 与时间戳约束、车辆地速 runtime（相对流、静止车为 0、方向、冷启动、冻结帧、尺度中位数）、高架实体 runtime（每板密度与算术平均车速、中心归属、重叠掩码只算一次、速度不可用整帧无效、冻结帧、`valid` 时 `mean=None` 表示该板没车可测、拥挤判定四档边界与可配置阈值）、实时 relay（最新帧队列丢旧、ffmpeg 参数、分辨率校验、relay 参数校验、帧尺寸变化时重建引擎）、共享内存槽与消息就绪判定、参数校验与 GPU 列表解析、分层依赖（`engine` 不 import `runtime`/torch、`engine.pipeline` 不 import 组合根、`assembly` 不 import 编排、`perception` 不 import 引擎、`domain` 不 import 上层）、两个入口共用同一套参数与校验、`cli.py` 的 `batch`/`relay` 分发。
+129 个测试覆盖：几何校验、掩码并集/涂黑（含复用缓冲与"空桥面"判定）、`StageResult` 携带失效原因而不是布尔标志、`ObservationAssembler` 的六条失效优先级（分割/车辆/车道线适配器错误、两条 tracker 错误、空桥面跳过检测）、deck 贪心匹配（顺序交换/漏检保持/新板新 id/大掩码降采样）、ByteTrack 分标签 id 与时间戳约束、车辆地速 runtime（相对流、静止车为 0、方向、冷启动、冻结帧、尺度中位数）、高架实体 runtime（每板密度与算术平均车速、中心归属、重叠掩码只算一次、速度不可用整帧无效、冻结帧、`valid` 时 `mean=None` 表示该板没车可测、拥挤判定四档边界与可配置阈值）、实时 relay（最新帧队列丢旧、ffmpeg 参数、分辨率校验、relay 参数校验、帧尺寸变化时重建引擎）、共享内存槽与消息就绪判定、参数校验与 GPU 列表解析、分层依赖（`engine` 不 import `runtime`/torch、`engine.pipeline` 不 import 组合根、`assembly` 不 import 编排、`perception` 不 import 引擎、`domain` 不 import 上层）、两个入口共用同一套参数与校验、`cli.py` 的 `batch`/`relay` 分发。

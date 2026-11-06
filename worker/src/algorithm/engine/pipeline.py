@@ -1,39 +1,15 @@
-"""Multi-process, multi-GPU pipeline: segment, then detect two ways in parallel.
+"""The parent side of the engines: one frame in, one Observation out.
 
-Topology, one OS process and one GPU per model::
+Three worker processes own the models (:mod:`algorithm.engine.workers`); this
+object owns everything around them -- the ring of shared-memory slots, the
+queues, the order frames are assembled in, and the failure paths.
 
-    parent (CPU)                        workers
-    ────────────                        ────────
-    submit(frame, ts, seq)
-      └─ slot[seq] ◀── shared memory ──▶ segment worker(s)   GPU a, b, …
-                                              │  masked frame + instance masks
-                                              ├─▶ vehicle worker  GPU c
-                                              └─▶ lane worker     GPU d
-    assemble in seq order  ◀──────────────  results
-      └─ ObservationAssembler: trackers + error policy
+``submit`` is non-blocking until ``window`` frames are in flight (that bound is
+the backpressure), ``result`` returns the next observation in submission order,
+and ``run`` does both while keeping the ring full, so throughput is set by the
+slowest stage instead of by the sum of all three.
 
-Frames cross process boundaries through a ring of ``window`` shared-memory slots
-(:mod:`algorithm.engine.shared`), so a 1080p frame costs one ``memcpy`` per hop
-instead of a six-megabyte pickle.  Inference lives in the workers; the trackers
-stay in the parent, which assembles frames strictly in submission order, so
-ByteTrack and the deck tracker see every frame exactly once and in the order it
-was submitted.  What the workers produce *is* the scheduling: the parent takes
-their outputs, turns them into one :class:`~algorithm.perception.assembly.StageResult`
-and hands it to :class:`~algorithm.perception.assembly.ObservationAssembler`, the
-single place where a frame's validity is decided.
-
-Why processes and not threads: each model owns a CUDA context and its own
-working set, and the pinning is per process (``CUDA_VISIBLE_DEVICES`` before
-``import torch``), which is the only way to be sure a worker never allocates on a
-neighbour's card.  Why more than one segment worker: segmentation is the longest
-stage, so N segment workers on N cards halve/n-th it while the two detectors run
-side by side behind it.
-
-Measured on 8x RTX 4080, 1920x1080 in, ``segment_imgsz=960``, ``imgsz=640``
-(see ``worker/scripts/bench_stages.py``): ~20 ms per frame (49 fps) with one
-segment worker and ~14 ms per frame (71 fps) with two, because segmentation
-stops being the critical path.  Batch throughput including decode and the deck
-statistics is ~62 fps with two segment workers.
+The parent loads no model and never touches CUDA, which is what lets it fork.
 """
 
 from __future__ import annotations
@@ -56,6 +32,7 @@ from algorithm.engine import workers
 from algorithm.engine.packet import FrameGeometryChanged, FramePacket
 from algorithm.engine.shared import (
     LINE,
+    SEGMENT,
     VEHICLE,
     DetectionDone,
     SegmentDone,
@@ -97,6 +74,17 @@ def _as_error(message: str | None) -> BaseException | None:
     process boundary there is no object to carry, so the text is re-wrapped.
     """
     return None if message is None else RuntimeError(message)
+
+
+def _frame_error(frame: object) -> str | None:
+    """What ``frame`` is missing to be a usable BGR image, or ``None`` if it is."""
+    if not isinstance(frame, np.ndarray) or frame.ndim != 3 or frame.size == 0:
+        return "an H x W x 3 frame"
+    if frame.shape[2] != 3:
+        return "3 channels (BGR)"
+    if frame.dtype != np.uint8:
+        return "uint8 pixels"
+    return None
 
 
 def _start_method() -> str:
@@ -211,51 +199,39 @@ class MultiProcessPipeline:
         self._q_out = context.Queue(maxsize=self.window * 4)
         self._stop = context.Event()
 
-        height_, width_ = self._height, self._width
-        specs: list[tuple[object, tuple[object, ...], str]] = []
-        for index, gpu in enumerate(self.mp.segment_gpus):
-            specs.append(
-                (
-                    workers.segment_worker,
-                    (
-                        gpu,
-                        self.settings,
-                        self._slot_names,
-                        height_,
-                        width_,
-                        self._q_segment,
-                        self._q_vehicle,
-                        self._q_line,
-                        self._q_out,
-                        self._stop,
-                        self.mp.mask_capacity,
-                    ),
-                    f"mp-segment-{index}-gpu{gpu}",
-                )
+        def spec(role: str, gpu: int, name: str, q_in: object) -> workers.WorkerSpec:
+            """One worker's inputs; the segment role also feeds both detectors."""
+            segment = role == SEGMENT
+            return workers.WorkerSpec(
+                role=role,
+                gpu=gpu,
+                name=name,
+                settings=self.settings,
+                names=self._slot_names,
+                height=self._height,
+                width=self._width,
+                q_in=q_in,
+                q_out=self._q_out,
+                stop=self._stop,
+                q_vehicle=self._q_vehicle if segment else None,
+                q_line=self._q_line if segment else None,
+                capacity=self.mp.mask_capacity if segment else 0,
             )
-        for target, gpu, queue in (
-            (workers.vehicle_worker, self.mp.vehicle_gpu, self._q_vehicle),
-            (workers.line_worker, self.mp.line_gpu, self._q_line),
-        ):
-            specs.append(
-                (
-                    target,
-                    (
-                        gpu,
-                        self.settings,
-                        self._slot_names,
-                        height_,
-                        width_,
-                        queue,
-                        self._q_out,
-                        self._stop,
-                    ),
-                    f"mp-{target.__name__.split('_')[0]}-gpu{gpu}",
-                )
+
+        specs = [
+            spec(SEGMENT, gpu, f"mp-segment-{index}-gpu{gpu}", self._q_segment)
+            for index, gpu in enumerate(self.mp.segment_gpus)
+        ]
+        specs += [
+            spec(role, gpu, f"mp-{role}-gpu{gpu}", queue)
+            for role, gpu, queue in (
+                (VEHICLE, self.mp.vehicle_gpu, self._q_vehicle),
+                (LINE, self.mp.line_gpu, self._q_line),
             )
-        for target, arguments, name in specs:
+        ]
+        for worker in specs:
             process = context.Process(
-                target=target, args=arguments, name=name, daemon=True
+                target=workers.run_worker, args=(worker,), name=worker.name, daemon=True
             )
             process.start()
             self._processes.append(process)
@@ -282,19 +258,6 @@ class MultiProcessPipeline:
             target=self._post_loop, name="mp-assembler", daemon=True
         )
         self._post_thread.start()
-
-    def warm_up(self, height: int, width: int) -> None:
-        """Start the workers and pay their model load before the clock starts.
-
-        Only the geometry is needed: each worker warms its own model as it
-        starts, and the ring of slots has to be allocated at a fixed size before
-        any frame can be submitted.  This method exists so an entry point can
-        warm any engine without knowing which one it holds -- and without
-        allocating a placeholder frame this engine would never look at.
-        """
-        if self.started:
-            return
-        self.start(int(height), int(width))
 
     def close(self) -> None:
         """Stop the workers, drop in-flight frames and free the shared memory."""
@@ -337,12 +300,6 @@ class MultiProcessPipeline:
         self._slots = []
         self._processes = []
 
-    def __enter__(self) -> "MultiProcessPipeline":
-        return self
-
-    def __exit__(self, *exc_info: object) -> None:
-        self.close()
-
     # -- frame API ---------------------------------------------------------
     def submit(
         self,
@@ -354,11 +311,9 @@ class MultiProcessPipeline:
     ) -> None:
         """Queue one frame; blocks while ``window`` frames are already in flight."""
         self._ensure_started(frame)
-        if (
-            frame.ndim != 3
-            or frame.shape[0] != self._height
-            or frame.shape[1] != self._width
-            or frame.dtype != np.uint8
+        if _frame_error(frame) is not None or (frame.shape[0], frame.shape[1]) != (
+            self._height,
+            self._width,
         ):
             raise FrameGeometryChanged(
                 f"frame {frame.shape} {frame.dtype} does not match the started "
@@ -378,44 +333,17 @@ class MultiProcessPipeline:
             self._order.append(frame_sequence)
         self._q_segment.put((frame_sequence, slot))
 
-    def result(self, timeout: float | None = None) -> Observation:
+    def result(self) -> Observation:
         """Next observation in submission order; blocks until it is assembled."""
         if not self.started and not self._closed:
             raise RuntimeError("pipeline has not been started; submit a frame first")
-        deadline = None if timeout is None else monotonic() + timeout
         while True:
-            remaining = _RESULT_POLL_S
-            if deadline is not None:
-                remaining = min(remaining, deadline - monotonic())
-                if remaining <= 0.0:
-                    raise TimeoutError("no observation was assembled in time")
             try:
-                return self._results.get(timeout=remaining)
+                return self._results.get(timeout=_RESULT_POLL_S)
             except _queue.Empty:
                 self._raise_if_failed()
                 if self._closed:
                     raise RuntimeError("pipeline is closed")
-
-    def process(
-        self,
-        frame: np.ndarray,
-        *,
-        timestamp_ms: int,
-        frame_sequence: int,
-        generation: int = 0,
-    ) -> Observation:
-        """Blocking single frame: ``submit`` then ``result``.
-
-        Costs one full pipeline latency and overlaps with nothing; use
-        :meth:`run` (or interleave ``submit``/``result``) to actually pipeline.
-        """
-        self.submit(
-            frame,
-            timestamp_ms=timestamp_ms,
-            frame_sequence=frame_sequence,
-            generation=generation,
-        )
-        return self.result()
 
     def run(
         self, frames: Iterable[FramePacket]
@@ -451,12 +379,8 @@ class MultiProcessPipeline:
     def _ensure_started(self, frame: np.ndarray) -> None:
         if self.started:
             return
-        if not isinstance(frame, np.ndarray) or frame.ndim != 3 or frame.size == 0:
-            raise ValueError("multi-process pipeline needs an H x W x 3 frame")
-        if frame.shape[2] != 3:
-            raise ValueError("multi-process pipeline needs 3 channels (BGR)")
-        if frame.dtype != np.uint8:
-            raise ValueError("multi-process pipeline needs uint8 frames")
+        if (problem := _frame_error(frame)) is not None:
+            raise ValueError(f"multi-process pipeline needs {problem}")
         self.start(int(frame.shape[0]), int(frame.shape[1]))
 
     def _wait_ready(self) -> None:

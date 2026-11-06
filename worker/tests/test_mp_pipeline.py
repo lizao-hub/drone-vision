@@ -1,5 +1,6 @@
 """Multi-process pipeline plumbing that can be tested without spawning GPUs."""
 
+import pickle
 import sys
 from pathlib import Path
 
@@ -10,12 +11,14 @@ from algorithm.config import MpPipelineSettings, PipelineSettings
 from algorithm.engine import shared
 from algorithm.engine.pipeline import MultiProcessPipeline, _Parts, _start_method
 from algorithm.engine.shared import (
+    SEGMENT,
     DetectionDone,
     SegmentDone,
     Slot,
     frame_view,
     mask_view,
 )
+from algorithm.engine.workers import WorkerSpec
 from algorithm.perception.assembly import ObservationAssembler
 from algorithm.perception.viaduct_tracker import ViaductTracker
 from drone_worker.args import parse_gpus
@@ -48,6 +51,26 @@ def _pipeline() -> MultiProcessPipeline:
             viaduct_tracker=ViaductTracker(),
         ),
     )
+
+
+def test_a_worker_spec_survives_pickling():
+    # Under fork the spec is inherited; on Windows the whole object travels
+    # through pickle to the child, so it has to stay a plain value.
+    spec = WorkerSpec(
+        role=SEGMENT,
+        gpu=2,
+        name="mp-segment-0-gpu2",
+        settings=_settings(),
+        names=(("frame", "masked", "masks"),),
+        height=4,
+        width=6,
+        q_in=None,
+        q_out=None,
+        stop=None,
+        capacity=8,
+    )
+
+    assert pickle.loads(pickle.dumps(spec)) == spec
 
 
 def test_mp_settings_defaults_put_the_three_models_on_three_cards():

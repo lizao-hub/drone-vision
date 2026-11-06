@@ -27,7 +27,9 @@ from __future__ import annotations
 import os
 import queue as _queue
 import traceback
+from dataclasses import dataclass
 from time import perf_counter
+from typing import Any
 
 import numpy as np
 
@@ -48,6 +50,30 @@ from algorithm.perception.masking import deck_frame
 # The one device a worker is allowed to see, after pinning.
 _PINNED_DEVICE = "cuda:0"
 _QUEUE_TIMEOUT_S = 0.2
+
+
+@dataclass(frozen=True)
+class WorkerSpec:
+    """Everything one worker process needs, pickled once when it is spawned.
+
+    One type for all three roles.  The segment worker additionally receives the
+    two detector queues and the per-frame instance capacity, which is why those
+    three fields have defaults; ``run_worker`` dispatches on ``role``.
+    """
+
+    role: str
+    gpu: int
+    name: str
+    settings: PipelineSettings
+    names: tuple[tuple[str, str, str], ...]
+    height: int
+    width: int
+    q_in: Any
+    q_out: Any
+    stop: Any
+    q_vehicle: Any = None
+    q_line: Any = None
+    capacity: int = 0
 
 
 def _pin_gpu(gpu: int) -> None:
@@ -93,20 +119,15 @@ def _log_failure(role: str, seq: int, exc: BaseException, seen: set[str]) -> Non
     print(f"[mp:{role}] frame {seq} failed: {message}", flush=True)
 
 
-def _segment_loop(
-    gpu: int,
-    settings: PipelineSettings,
-    names: tuple[tuple[str, str, str], ...],
-    height: int,
-    width: int,
-    q_in: object,
-    q_vehicle: object,
-    q_line: object,
-    q_out: object,
-    stop: object,
-    capacity: int,
-) -> None:
+def _segment_loop(spec: WorkerSpec) -> None:
     from algorithm.perception.segment_model import ViaductSegmentAdapter  # noqa: PLC0415
+
+    # The loop below is the whole worker; unbundle the spec once at the top.
+    gpu, settings, names = spec.gpu, spec.settings, spec.names
+    height, width = spec.height, spec.width
+    q_in, q_out = spec.q_in, spec.q_out
+    q_vehicle, q_line, stop = spec.q_vehicle, spec.q_line, spec.stop
+    capacity = spec.capacity
 
     _pin_gpu(gpu)
     adapter = ViaductSegmentAdapter(
@@ -197,18 +218,13 @@ def _segment_loop(
             segment.close()
 
 
-def _detector_loop(
-    role: str,
-    gpu: int,
-    settings: PipelineSettings,
-    names: tuple[tuple[str, str, str], ...],
-    height: int,
-    width: int,
-    q_in: object,
-    q_out: object,
-    stop: object,
-) -> None:
+def _detector_loop(spec: WorkerSpec) -> None:
     from algorithm.perception.detect_models import DetectionAdapter  # noqa: PLC0415
+
+    # The loop below is the whole worker; unbundle the spec once at the top.
+    role, gpu, settings, names = spec.role, spec.gpu, spec.settings, spec.names
+    height, width = spec.height, spec.width
+    q_in, q_out, stop = spec.q_in, spec.q_out, spec.stop
 
     _pin_gpu(gpu)
     if role == VEHICLE:
@@ -285,74 +301,9 @@ def _run(role: str, body: object, q_out: object) -> None:
         raise SystemExit(1) from exc
 
 
-def segment_worker(
-    gpu: int,
-    settings: PipelineSettings,
-    names: tuple[tuple[str, str, str], ...],
-    height: int,
-    width: int,
-    q_in: object,
-    q_vehicle: object,
-    q_line: object,
-    q_out: object,
-    stop: object,
-    capacity: int,
-) -> None:
-    """Process entry point: one segmentation model on GPU ``gpu``."""
-    _run(
-        SEGMENT,
-        lambda: _segment_loop(
-            gpu,
-            settings,
-            names,
-            height,
-            width,
-            q_in,
-            q_vehicle,
-            q_line,
-            q_out,
-            stop,
-            capacity,
-        ),
-        q_out,
-    )
-
-
-def vehicle_worker(
-    gpu: int,
-    settings: PipelineSettings,
-    names: tuple[tuple[str, str, str], ...],
-    height: int,
-    width: int,
-    q_in: object,
-    q_out: object,
-    stop: object,
-) -> None:
-    """Process entry point: the vehicle detector on GPU ``gpu``."""
-    _run(
-        VEHICLE,
-        lambda: _detector_loop(
-            VEHICLE, gpu, settings, names, height, width, q_in, q_out, stop
-        ),
-        q_out,
-    )
-
-
-def line_worker(
-    gpu: int,
-    settings: PipelineSettings,
-    names: tuple[tuple[str, str, str], ...],
-    height: int,
-    width: int,
-    q_in: object,
-    q_out: object,
-    stop: object,
-) -> None:
-    """Process entry point: the lane-line detector on GPU ``gpu``."""
-    _run(
-        LINE,
-        lambda: _detector_loop(
-            LINE, gpu, settings, names, height, width, q_in, q_out, stop
-        ),
-        q_out,
-    )
+def run_worker(spec: WorkerSpec) -> None:
+    """Process entry point: build this worker's model, then loop until stopped."""
+    if spec.role == SEGMENT:
+        _run(SEGMENT, lambda: _segment_loop(spec), spec.q_out)
+    else:
+        _run(spec.role, lambda: _detector_loop(spec), spec.q_out)

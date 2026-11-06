@@ -85,7 +85,7 @@ def main_batch(argv: Sequence[str] | None = None) -> int:
     # Load the models (and warm them) before the clock starts, so ``wall``/``fps``
     # measure the stream and not the one-off start-up: this allocates the shared
     # memory and starts the three workers at the source geometry.
-    pipeline.warm_up(source.height, source.width)
+    pipeline.start(source.height, source.width)
     viaduct_runtime = ViaductRuntime(
         speed=VehicleSpeedRuntime(
             frame_width=source.width,
