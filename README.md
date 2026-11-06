@@ -18,7 +18,7 @@ worker/                算法主体（uv 项目 + Dockerfile）
   src/algorithm/domain/      契约 + 状态机（车辆地速、每板密度/均速/拥挤度）
   src/algorithm/perception/  模型适配、ByteTrack、deck 追踪、pipeline
   src/algorithm/runtime/     帧源（文件/RTSP）、RTMP 推流、JSONL 快照、组合根
-  src/drone_worker/          批处理 CLI、relay 入口、渲染
+  src/drone_worker/          batch / relay 两个入口、分发、渲染
 backend/               控制 API（FastAPI + Docker SDK / 本地进程模式）
 frontend/              Vue 3 + Vite + nginx
 deploy/mediamtx/       MediaMTX 配置

@@ -18,6 +18,8 @@ cd E:\Pycharm\drone-vision\worker
 "D:\Software\Anaconda3\envs\pytorch\python.exe" -m drone_worker --video videos\test_Video1.mp4
 ```
 
+`batch` 子命令等价（`python -m drone_worker batch --video videos\test_Video1.mp4`）。
+
 输出：
 
 - `output/<视频名>_pipeline.mp4`：高架区域不涂色、其余区域蓝色半透明 + 只给有速度的车画框并在框内写速度 + 左下角每块板一行 `#1 15.8% n9 22km/h moderate`（颜色与板上轮廓、`#N` 标签一致）
@@ -143,8 +145,9 @@ $env:PYTHONPATH="E:\Pycharm\drone-vision\worker\src"
 | `src/algorithm/runtime/snapshots.py` | `record()`：`Observation` + `ViaductUpdate` → JSONL 一行 |
 | `src/algorithm/runtime/factory.py` | 组合根：`PipelineSettings` → 已装配的 pipeline；默认权重/视频路径 |
 | `src/drone_worker/render.py` | 可视化：高架外蓝色半透明、有速度的车框 + 速度、左下角每板一行统计（同色轮廓 + `#N` 锚点） |
-| `src/drone_worker/relay.py` | `python -m drone_worker relay`：RTSP 进、标注 RTMP 出 |
-| `src/drone_worker/cli.py` | 入口：默认批处理，`relay` 子命令转给 `relay.py` |
+| `src/drone_worker/batch.py` | `python -m drone_worker [batch]`：视频文件进、标注 mp4 / JSONL 出（默认入口） |
+| `src/drone_worker/relay.py` | `python -m drone_worker relay`：RTSP 进、标注 RTMP 出（实时入口） |
+| `src/drone_worker/cli.py` | 入口分发：默认 / `batch` → `batch.py`，`relay` → `relay.py` |
 
 ## 行为约定
 
