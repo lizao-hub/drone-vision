@@ -37,14 +37,6 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
                         help="RTSP URL, or a local video file (replayed in real time, looped)")
     parser.add_argument("--dest", required=True, help="RTMP URL for the annotated stream")
     parser.add_argument("--device", default="cpu", help="integer GPU index or 'cpu' (default: cpu)")
-    parser.add_argument("--segment-imgsz", type=int, default=960)
-    parser.add_argument("--detect-imgsz", type=int, default=640)
-    parser.add_argument("--line-imgsz", type=int, default=640)
-    parser.add_argument("--viaduct-conf", type=float, default=0.25)
-    parser.add_argument("--vehicle-conf", type=float, default=0.30)
-    parser.add_argument("--line-conf", type=float, default=0.30)
-    parser.add_argument("--car-width-m", type=float, default=1.95,
-                        help="real width of a car for the pixel scale (default: 1.95)")
     parser.add_argument("--fps", type=float, default=25.0,
                         help="nominal source fps handed to the trackers (default: 25)")
     parser.add_argument("--out-fps", type=float, default=10.0,
@@ -97,24 +89,24 @@ def _install_stop_handlers(stop: threading.Event) -> None:
 
 def main_relay(argv: Sequence[str] | None = None) -> int:
     # Imported here so parsing ``relay --help`` does not load the models.
-    from algorithm.runtime.factory import build_pipeline, default_settings
+    from algorithm.runtime.factory import build_pipeline
+    from algorithm.runtime.profile import DEFAULT_PROFILE, load_profile
+    from algorithm.runtime.provenance import code_revision
 
     args = _parse_args(argv)
     stop = threading.Event()
     _install_stop_handlers(stop)
 
-    settings = default_settings(
+    profile = load_profile()
+    settings = profile.to_settings(
         device=parse_device(args.device),
-        segment_imgsz=args.segment_imgsz,
-        detect_imgsz=args.detect_imgsz,
-        line_imgsz=args.line_imgsz,
-        viaduct_confidence=args.viaduct_conf,
-        vehicle_confidence=args.vehicle_conf,
-        line_confidence=args.line_conf,
-        car_width_m=args.car_width_m,
         track_max_lost_ms=args.track_timeout_ms,
     )
-    print(f"relay: loading models (device={args.device})", flush=True)
+    print(
+        f"relay: revision={code_revision()} profile={DEFAULT_PROFILE.name} "
+        f"loading models (device={args.device})",
+        flush=True,
+    )
     try:
         pipeline = build_pipeline(settings, fps=args.fps)
     except Exception as exc:  # noqa: BLE001 - a missing GPU must not kill the demo
@@ -144,7 +136,9 @@ def main_relay(argv: Sequence[str] | None = None) -> int:
 
     try:
         while not stop.is_set():
+            wait_started = monotonic()
             packet = source.get(timeout=1.0)
+            queue_wait_ms = (monotonic() - wait_started) * 1000.0
             if packet is None:
                 continue
 
@@ -170,7 +164,12 @@ def main_relay(argv: Sequence[str] | None = None) -> int:
                 print(f"relay: frame size {width}x{height}", flush=True)
             assert runtime is not None
 
-            observation = pipeline.process(frame, packet.timestamp_ms, packet.frame_index)
+            observation = pipeline.process(
+                frame,
+                packet.timestamp_ms,
+                packet.frame_index,
+                queue_wait_ms=queue_wait_ms,
+            )
             viaduct = runtime.update(observation)
             last_viaduct = viaduct
             annotated = annotate(frame, observation, viaduct=viaduct)
@@ -185,12 +184,14 @@ def main_relay(argv: Sequence[str] | None = None) -> int:
                     ffmpeg=args.ffmpeg,
                 )
                 sink.start()
+            sink_started = monotonic()
             try:
                 sink.write(annotated)
             except (BrokenPipeError, OSError) as exc:
                 print(f"relay: sink lost ({exc}); restarting", flush=True)
                 sink.close()
                 sink = None
+            sink_ms = (monotonic() - sink_started) * 1000.0
 
             processed += 1
             if args.max_frames and processed >= args.max_frames:
@@ -217,7 +218,9 @@ def main_relay(argv: Sequence[str] | None = None) -> int:
                     detail = "invalid: " + ", ".join(last_viaduct.reasons)
                 print(
                     f"relay: {processed} frames, {processed / elapsed:.1f} fps,"
-                    f" dropped {source.dropped}, {detail}",
+                    f" dropped {source.dropped},"
+                    f" proc={observation.diagnostics.processing_ms:.0f}ms"
+                    f" wait={queue_wait_ms:.0f}ms sink={sink_ms:.0f}ms, {detail}",
                     flush=True,
                 )
     finally:

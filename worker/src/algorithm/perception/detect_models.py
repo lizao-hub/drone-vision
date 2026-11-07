@@ -8,9 +8,12 @@ from typing import Any
 
 import numpy as np
 
-from algorithm.domain.geometry import Box
-from algorithm.domain.observations import DetectedObject
-from algorithm.perception.raw import clamp_unit, sdk_to_list, verify_weight_file
+from algorithm.perception.raw import (
+    RawDetection,
+    clamp_unit,
+    sdk_to_list,
+    verify_weight_file,
+)
 
 
 class DetectionAdapter:
@@ -63,7 +66,7 @@ class DetectionAdapter:
         self._device = device
         self._imgsz = imgsz
 
-    def predict(self, frame: np.ndarray) -> tuple[DetectedObject, ...]:
+    def predict(self, frame: np.ndarray) -> tuple[RawDetection, ...]:
         results = self._model.predict(
             source=frame,
             conf=self._confidence,
@@ -83,7 +86,7 @@ class DetectionAdapter:
         coordinates = sdk_to_list(result.boxes.xyxyn)
         confidences = sdk_to_list(result.boxes.conf)
         class_ids = sdk_to_list(result.boxes.cls)
-        detections: list[DetectedObject] = []
+        detections: list[RawDetection] = []
         for coords, confidence, class_id_value in zip(
             coordinates, confidences, class_ids, strict=True
         ):
@@ -98,10 +101,10 @@ class DetectionAdapter:
             if x2 <= x1 or y2 <= y1:
                 continue
             detections.append(
-                DetectedObject(
+                RawDetection(
                     label=label,
                     confidence=float(confidence),
-                    box=Box(x1, y1, x2, y2),
+                    box=(x1, y1, x2, y2),
                 )
             )
         return tuple(detections)

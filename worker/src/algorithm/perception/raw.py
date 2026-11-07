@@ -1,14 +1,20 @@
-"""SDK-neutral helpers that keep torch objects out of the pipeline.
+"""SDK-neutral values that keep torch objects out of the pipeline.
 
-Adapters convert ultralytics ``Results`` into domain ``DetectedObject`` values
-here; everything below this module is numpy/domain only.
+Adapters convert ultralytics ``Results`` into :class:`RawDetection` here; the
+pipeline converts raw detections into domain :class:`DetectedObject` values.
+Everything below the adapters is numpy/domain only.
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from hashlib import sha256
+from math import isfinite
 from pathlib import Path
 from typing import Any
+
+from algorithm.domain.geometry import Box
+from algorithm.domain.observations import DetectedObject
 
 
 def sdk_to_list(value: Any) -> list[Any]:
@@ -28,6 +34,40 @@ def sdk_to_list(value: Any) -> list[Any]:
 def clamp_unit(value: float) -> float:
     """Clamp a detector coordinate into the normalized unit square."""
     return max(0.0, min(1.0, value))
+
+
+@dataclass(frozen=True, slots=True)
+class RawDetection:
+    """One detector row before it becomes a domain object.
+
+    Coordinates are normalized ``(x1, y1, x2, y2)`` and already clamped to the
+    unit square; a row with an empty or inverted box is rejected here rather than
+    silently dropped later.
+    """
+
+    label: str
+    confidence: float
+    box: tuple[float, float, float, float]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.label, str) or not self.label.strip():
+            raise ValueError("label must be a non-empty string")
+        if not isfinite(self.confidence) or not 0.0 <= self.confidence <= 1.0:
+            raise ValueError("confidence must be finite and within [0, 1]")
+        if len(self.box) != 4:
+            raise ValueError("box must hold four normalized coordinates")
+        x1, y1, x2, y2 = self.box
+        if not all(isfinite(value) for value in self.box):
+            raise ValueError("box coordinates must be finite")
+        if not (0.0 <= x1 < x2 <= 1.0 and 0.0 <= y1 < y2 <= 1.0):
+            raise ValueError("box must be ordered and inside the unit square")
+
+    def to_detected(self) -> DetectedObject:
+        return DetectedObject(
+            label=self.label,
+            confidence=self.confidence,
+            box=Box(*self.box),
+        )
 
 
 def verify_weight_file(path: Path, expected_sha256: str | None = None) -> Path:

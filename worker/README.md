@@ -15,17 +15,21 @@
 ```powershell
 $env:PYTHONPATH="E:\Pycharm\drone-vision\worker\src"
 cd E:\Pycharm\drone-vision\worker
-"D:\Software\Anaconda3\envs\pytorch\python.exe" -m drone_worker --video videos\test_Video1.mp4
+"D:\Software\Anaconda3\envs\pytorch\python.exe" -m drone_worker --source videos\video1_1080P.mp4
 ```
 
-`batch` 子命令等价（`python -m drone_worker batch --video videos\test_Video1.mp4`）。
+`batch` 子命令等价（`python -m drone_worker batch --source videos\video1_1080P.mp4`）。
 
-输出：
+输出（目录由 `--project` 决定，默认 `worker/output`）：
 
-- `output/<视频名>_pipeline.mp4`：高架区域不涂色、其余区域蓝色半透明 + 只给有速度的车画框并在框内写速度 + 左下角每块板一行 `#1 15.8% n9 22km/h moderate`（颜色与板上轮廓、`#N` 标签一致）
-- `--json output/<视频名>.jsonl`（可选）：每帧一条 Observation
+- `<视频名>.jsonl`（`--save-json`，**默认开**）：每帧一条 Observation；`--no-save-json` 关闭
+- `<视频名>_pipeline.mp4`（`--save-video`，**默认关**）：高架区域不涂色、其余区域蓝色半透明 + 只给有速度的车画框并在框内写速度 + 左下角每块板一行 `#1 15.8% n9 22km/h moderate`（颜色与板上轮廓、`#N` 标签一致）
 
-常用参数：`--stride`（默认 **3**，即每 3 帧推理一次、每 3 帧产出一个 Observation / 一行 JSON）、`--max-frames`（按采样帧计数）、`--car-width-m`（车辆参考宽度，默认 1.95）、`--device cpu`、`--viaduct-conf`、`--vehicle-conf`、`--line-conf`、`--line-imgsz`（默认 640）、`--no-video`。
+常用参数：`--source`（输入视频，必填）、`--project`（输出目录）、`--device`（GPU 序号或 `cpu`）、`--stride`（默认 **3**，即每 3 帧推理一次、每 3 帧产出一个 Observation / 一行 JSON），以及运维开关 `--max-frames`、`--log-every`、`--save-video`、`--no-save-json`。
+
+调参项不再走命令行，全部在 [config/pipeline.yaml](config/pipeline.yaml)：三个模型的权重路径、`imgsz`、置信度、`car_width_m`、ByteTrack 的 `max_lost_ms` / `match_threshold`。启动时用 pydantic 严格校验（未知字段、越界值直接报错），再经 `PipelineProfile.to_settings()` 变成 [config.py](src/algorithm/config.py) 的 `PipelineSettings`。
+
+每行 JSONL 的 `diagnostics` 现在是 fps 归因表：`segment_ms` / `detect_ms` / `line_ms` / `processing_ms`（流水线内），`decode_ms`（读帧解码），`queue_wait_ms`（直播取帧等待，batch 为 0），`sink_ms`（画框 + 写 mp4）。batch 会打印 `run: revision=...` 头行和 `timing:` 汇总行。
 
 ## 单帧数据流
 

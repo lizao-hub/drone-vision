@@ -9,8 +9,18 @@ from algorithm.domain.observations import DetectedObject, Observation, TrackedOb
 from algorithm.domain.viaduct_runtime import ViaductUpdate
 
 
-def record(observation: Observation, viaduct: ViaductUpdate) -> dict[str, Any]:
-    """One frame's observation plus the deck statistics, ready for ``json.dumps``."""
+def record(
+    observation: Observation,
+    viaduct: ViaductUpdate,
+    *,
+    sink_ms: float | None = None,
+) -> dict[str, Any]:
+    """One frame's observation plus the deck statistics, ready for ``json.dumps``.
+
+    ``sink_ms`` is the writer's own time for this frame; it is measured after the
+    pipeline returns, so the caller passes it in rather than the observation
+    carrying it.
+    """
     car_speeds = viaduct.speed
     return {
         "timestamp_ms": observation.timestamp_ms,
@@ -53,6 +63,7 @@ def record(observation: Observation, viaduct: ViaductUpdate) -> dict[str, Any]:
                     "mean_speed_kmh": None
                     if item.mean_speed_kmh is None
                     else round(item.mean_speed_kmh, 3),
+                    "mean_speed_state": item.speed_state.value,
                     "vehicles": item.vehicles,
                     "congestion": item.congestion.value,
                 }
@@ -64,6 +75,11 @@ def record(observation: Observation, viaduct: ViaductUpdate) -> dict[str, Any]:
             "detect_ms": round(observation.diagnostics.detect_ms, 2),
             "line_ms": round(observation.diagnostics.line_ms, 2),
             "processing_ms": round(observation.diagnostics.processing_ms, 2),
+            "decode_ms": round(observation.diagnostics.decode_ms, 2),
+            "queue_wait_ms": round(observation.diagnostics.queue_wait_ms, 2),
+            "sink_ms": round(
+                0.0 if sink_ms is None else sink_ms, 2
+            ),
         },
     }
 

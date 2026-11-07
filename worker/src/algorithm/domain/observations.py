@@ -68,10 +68,23 @@ class TrackedObject:
 
 @dataclass(frozen=True, slots=True)
 class Diagnostics:
+    """Where this frame's wall time went.
+
+    The first four are measured inside :class:`ObservationPipeline`; the last
+    three are supplied by the caller that owns the surrounding I/O (the file
+    reader, the drop-oldest queue, the video writer / RTMP sink) and default to
+    zero when that layer does not measure them.  Keeping them on the same value
+    object means one JSONL line answers "was that frame slow because of the
+    model, the decode, the queue or the encoder".
+    """
+
     segment_ms: float
     detect_ms: float
     line_ms: float
     processing_ms: float
+    decode_ms: float = 0.0
+    queue_wait_ms: float = 0.0
+    sink_ms: float = 0.0
 
     def __post_init__(self) -> None:
         for name, value in (
@@ -79,6 +92,9 @@ class Diagnostics:
             ("detect_ms", self.detect_ms),
             ("line_ms", self.line_ms),
             ("processing_ms", self.processing_ms),
+            ("decode_ms", self.decode_ms),
+            ("queue_wait_ms", self.queue_wait_ms),
+            ("sink_ms", self.sink_ms),
         ):
             if not isfinite(value) or value < 0.0:
                 raise ValueError(f"{name} must be finite and non-negative")

@@ -3,6 +3,7 @@ import numpy as np
 from algorithm.domain.geometry import Box, Mask
 from algorithm.domain.observations import DetectedObject, TrackedObject
 from algorithm.perception.pipeline import ObservationPipeline
+from algorithm.perception.raw import RawDetection
 from algorithm.perception.viaduct_tracker import ViaductTracker
 
 
@@ -38,12 +39,12 @@ class FakeSegmenter:
 
 
 class RecordingDetector:
-    def __init__(self, detections: tuple[DetectedObject, ...] = (), *, error: bool = False) -> None:
+    def __init__(self, detections: tuple[RawDetection, ...] = (), *, error: bool = False) -> None:
         self.detections = detections
         self.error = error
         self.seen_frames: list[np.ndarray] = []
 
-    def predict(self, frame: np.ndarray) -> tuple[DetectedObject, ...]:
+    def predict(self, frame: np.ndarray) -> tuple[RawDetection, ...]:
         self.seen_frames.append(frame.copy())
         if self.error:
             raise RuntimeError("detect backend exploded")
@@ -121,8 +122,8 @@ def test_pipeline_tracks_every_detection_from_the_masked_frame():
     # The masked image is the only filter: whatever the detector returns here is
     # published and tracked as-is, with no centre-in-mask post-filter.
     mask = _deck_mask()
-    on_deck = DetectedObject(label="car", confidence=0.8, box=Box(0.0, 0.0, 0.3, 0.5))
-    off_deck = DetectedObject(label="car", confidence=0.8, box=Box(0.6, 0.0, 0.9, 0.5))
+    on_deck = RawDetection("car", 0.8, (0.0, 0.0, 0.3, 0.5))
+    off_deck = RawDetection("car", 0.8, (0.6, 0.0, 0.9, 0.5))
     tracker = FakeTracker()
     pipeline = _build(
         viaduct_segment=FakeSegmenter(mask),
@@ -131,7 +132,7 @@ def test_pipeline_tracks_every_detection_from_the_masked_frame():
     )
     observation = pipeline.process(_frame(), 1000, 0)
 
-    assert observation.vehicle == (on_deck, off_deck)
+    assert observation.vehicle == (on_deck.to_detected(), off_deck.to_detected())
     assert [item.track_id for item in observation.vehicle_tracks] == [
         "car-bt-000001",
         "car-bt-000002",
@@ -223,7 +224,7 @@ def test_every_viaduct_instance_keeps_its_own_mask():
 
 
 def test_line_tracks_are_reported_and_see_the_blacked_out_frame():
-    marking = DetectedObject(label="line", confidence=0.8, box=Box(0.0, 0.0, 0.2, 1.0))
+    marking = RawDetection("line", 0.8, (0.0, 0.0, 0.2, 1.0))
     line_detector = RecordingDetector((marking,))
     line_tracker = FakeTracker()
     pipeline = _build(
@@ -237,7 +238,7 @@ def test_line_tracks_are_reported_and_see_the_blacked_out_frame():
     assert [item.track_id for item in observation.line_tracks] == ["line-bt-000001"]
     assert observation.line_tracks[0].label == "line"
     assert observation.vehicle_tracks == ()
-    assert line_tracker.seen[0] == (marking,)
+    assert line_tracker.seen[0] == (marking.to_detected(),)
     # Lane markings are read from the same blacked-out frame as the vehicles.
     assert (line_detector.seen_frames[0][:, 3:] == 0).all()
 

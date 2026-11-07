@@ -1,12 +1,12 @@
 """Shared production composition: settings in, wired pipeline out.
 
-Every entry point (CLI, batch regression, a live container loop) builds its
-pipeline here, so the wiring is not duplicated in the runner packages.
+Every entry point (batch, relay, a future service) builds its pipeline here, so
+the wiring is not duplicated in the runner packages.  Where the settings come
+from is not decided here: a profile file is loaded by
+:mod:`algorithm.runtime.profile` and turned into :class:`PipelineSettings`.
 """
 
 from __future__ import annotations
-
-from pathlib import Path
 
 from algorithm.config import PipelineSettings
 from algorithm.perception.detect_models import DetectionAdapter
@@ -18,44 +18,6 @@ from algorithm.perception.tracking import (
     ByteTracker,
 )
 from algorithm.perception.viaduct_tracker import ViaductTracker
-
-# .../worker/src/algorithm/runtime/factory.py -> worker/
-WORKER_ROOT = Path(__file__).resolve().parents[3]
-DEFAULT_VIADUCT_WEIGHT = WORKER_ROOT / "models" / "viaduct" / "weights" / "best.pt"
-DEFAULT_VEHICLE_WEIGHT = WORKER_ROOT / "models" / "vehicle" / "weights" / "best.pt"
-DEFAULT_LINE_WEIGHT = WORKER_ROOT / "models" / "line" / "weights" / "best.pt"
-DEFAULT_VIDEO = WORKER_ROOT / "videos" / "test_Video1.mp4"
-
-
-def default_settings(
-    *,
-    viaduct_weight: Path = DEFAULT_VIADUCT_WEIGHT,
-    vehicle_weight: Path = DEFAULT_VEHICLE_WEIGHT,
-    line_weight: Path = DEFAULT_LINE_WEIGHT,
-    device: int | str = 0,
-    segment_imgsz: int = 960,
-    detect_imgsz: int = 640,
-    line_imgsz: int = 640,
-    viaduct_confidence: float = 0.25,
-    vehicle_confidence: float = 0.30,
-    line_confidence: float = 0.30,
-    car_width_m: float = 1.95,
-    track_max_lost_ms: int = 1000,
-) -> PipelineSettings:
-    return PipelineSettings(
-        viaduct_weight=viaduct_weight,
-        vehicle_weight=vehicle_weight,
-        line_weight=line_weight,
-        device=device,
-        segment_imgsz=segment_imgsz,
-        detect_imgsz=detect_imgsz,
-        line_imgsz=line_imgsz,
-        viaduct_confidence=viaduct_confidence,
-        vehicle_confidence=vehicle_confidence,
-        line_confidence=line_confidence,
-        car_width_m=car_width_m,
-        track_max_lost_ms=track_max_lost_ms,
-    )
 
 
 def build_pipeline(settings: PipelineSettings, *, fps: float) -> ObservationPipeline:

@@ -14,6 +14,7 @@ from algorithm.domain.observations import (
     TrackedObject,
 )
 from algorithm.perception.masking import apply_mask, union_mask
+from algorithm.perception.raw import RawDetection
 from algorithm.perception.viaduct_tracker import ViaductTracker
 
 
@@ -22,7 +23,9 @@ class SegmentationPredictor(Protocol):
 
 
 class DetectionPredictor(Protocol):
-    def predict(self, frame: np.ndarray) -> tuple[DetectedObject, ...]: ...
+    """Detector output before it becomes domain state: see :class:`RawDetection`."""
+
+    def predict(self, frame: np.ndarray) -> tuple[RawDetection, ...]: ...
 
 
 class Tracker(Protocol):
@@ -80,14 +83,27 @@ class ObservationPipeline:
         timestamp_ms: int,
         frame_sequence: int,
         generation: int = 0,
+        *,
+        decode_ms: float = 0.0,
+        queue_wait_ms: float = 0.0,
     ) -> Observation:
         started = perf_counter()
+
+        def invalid(*args: object, **kwargs: object) -> Observation:
+            """Void the frame, still reporting the caller's own I/O time."""
+            return self._invalid(
+                *args,
+                **kwargs,
+                decode_ms=decode_ms,
+                queue_wait_ms=queue_wait_ms,
+            )
+
         if (
             not isinstance(frame, np.ndarray)
             or frame.ndim != 3
             or frame.size == 0
         ):
-            return self._invalid(
+            return invalid(
                 timestamp_ms, frame_sequence, generation, ("frame_invalid",), started
             )
         height, width = int(frame.shape[0]), int(frame.shape[1])
@@ -97,7 +113,7 @@ class ObservationPipeline:
         try:
             viaduct_segmentations = self.viaduct_segment.predict(frame)
         except Exception:  # noqa: BLE001 - third-party runtimes raise their own types
-            return self._invalid(
+            return invalid(
                 timestamp_ms,
                 frame_sequence,
                 generation,
@@ -120,7 +136,7 @@ class ObservationPipeline:
         try:
             viaduct_tracks = self.viaduct_tracker.update(timestamp_ms, viaduct)
         except Exception:  # noqa: BLE001
-            return self._invalid(
+            return invalid(
                 timestamp_ms,
                 frame_sequence,
                 generation,
@@ -149,6 +165,8 @@ class ObservationPipeline:
                     detect_ms=0.0,
                     line_ms=0.0,
                     processing_ms=(perf_counter() - started) * 1000.0,
+                    decode_ms=decode_ms,
+                    queue_wait_ms=queue_wait_ms,
                 ),
             )
 
@@ -162,9 +180,11 @@ class ObservationPipeline:
         masked = apply_mask(frame, mask, out=self._masked)
         detect_started = perf_counter()
         try:
-            vehicle = self.vehicle_detection.predict(masked)
+            vehicle = tuple(
+                item.to_detected() for item in self.vehicle_detection.predict(masked)
+            )
         except Exception:  # noqa: BLE001
-            return self._invalid(
+            return invalid(
                 timestamp_ms,
                 frame_sequence,
                 generation,
@@ -185,7 +205,7 @@ class ObservationPipeline:
                 generation=generation,
             )
         except Exception:  # noqa: BLE001
-            return self._invalid(
+            return invalid(
                 timestamp_ms,
                 frame_sequence,
                 generation,
@@ -198,9 +218,11 @@ class ObservationPipeline:
         # Step 6: lane markings on the same blacked-out image, then track them.
         line_started = perf_counter()
         try:
-            line = self.line_detection.predict(masked)
+            line = tuple(
+                item.to_detected() for item in self.line_detection.predict(masked)
+            )
         except Exception:  # noqa: BLE001
-            return self._invalid(
+            return invalid(
                 timestamp_ms,
                 frame_sequence,
                 generation,
@@ -220,7 +242,7 @@ class ObservationPipeline:
                 generation=generation,
             )
         except Exception:  # noqa: BLE001
-            return self._invalid(
+            return invalid(
                 timestamp_ms,
                 frame_sequence,
                 generation,
@@ -247,6 +269,8 @@ class ObservationPipeline:
                 detect_ms=detect_ms,
                 line_ms=line_ms,
                 processing_ms=(perf_counter() - started) * 1000.0,
+                decode_ms=decode_ms,
+                queue_wait_ms=queue_wait_ms,
             ),
         )
 
@@ -261,6 +285,8 @@ class ObservationPipeline:
         segment_ms: float = 0.0,
         detect_ms: float = 0.0,
         line_ms: float = 0.0,
+        decode_ms: float = 0.0,
+        queue_wait_ms: float = 0.0,
     ) -> Observation:
         return Observation(
             timestamp_ms=timestamp_ms,
@@ -278,5 +304,7 @@ class ObservationPipeline:
                 detect_ms=detect_ms,
                 line_ms=line_ms,
                 processing_ms=(perf_counter() - started) * 1000.0,
+                decode_ms=decode_ms,
+                queue_wait_ms=queue_wait_ms,
             ),
         )

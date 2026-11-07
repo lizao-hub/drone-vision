@@ -1,0 +1,30 @@
+# Pipeline profile: model assets and the thresholds they were validated with.
+#
+# These used to be command-line flags (`--segment-imgsz`, `--viaduct-conf`, ...).
+# They are deployment data now: edit this file, keep it next to the weights it
+# describes, and every entry point (batch, relay) picks it up.  Paths are resolved
+# against the `worker/` directory unless absolute.
+#
+# Loading is strict: an unknown key is an error, not a silent default.
+
+viaduct:
+  weights: models/viaduct/weights/best.pt   # segment, single class "viaduct"
+  imgsz: 960
+  confidence: 0.25
+
+vehicle:
+  weights: models/vehicle/weights/best.pt   # detect, single class "car"
+  imgsz: 640
+  confidence: 0.30
+
+line:
+  weights: models/line/weights/best.pt      # detect, single class "line"
+  imgsz: 640
+  confidence: 0.30
+
+# Real width of a car, used to scale pixels to metres for the ground speed.
+car_width_m: 1.95
+
+tracking:
+  max_lost_ms: 1000       # ByteTrack lost timeout (batch); relay overrides to 3000
+  match_threshold: 0.80

@@ -29,10 +29,12 @@ WORKDIR /app
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Keep the source tree at /app/src: WORKER_ROOT is derived from
-# src/algorithm/runtime/factory.py and must resolve to /app, where models/ and
-# videos/ are mounted.
+# Keep the source tree at /app/src: both src/algorithm/runtime/factory.py and
+# src/drone_worker/batch.py derive the worker root from their own __file__ and
+# must resolve to /app, where models/ and videos/ are mounted.
 COPY src ./src
+# Pipeline profile (model paths, imgsz, thresholds): /app/config/pipeline.yaml.
+COPY config ./config
 ENV PYTHONPATH=/app/src
 
 ENTRYPOINT ["python", "-m", "drone_worker"]

@@ -36,10 +36,10 @@ docker-compose.yml     本地演示平台编排
 ```powershell
 cd worker
 $env:PYTHONPATH="E:\Pycharm\drone-vision\worker\src"
-"D:\Software\Anaconda3\envs\pytorch\python.exe" -m drone_worker --video videos\test_Video1.mp4
+"D:\Software\Anaconda3\envs\pytorch\python.exe" -m drone_worker --source videos\video1_1080P.mp4
 ```
 
-输出 `worker/output/<视频名>_pipeline.mp4`；加 `--json output/<视频名>.jsonl` 可另存每帧一条 Observation。参数、数据结构与各 runtime 的判定规则见 [worker/README.md](worker/README.md)。
+默认输出到 `worker/output/`：`<视频名>.jsonl`（每帧一条 Observation，默认开）和 `<视频名>_pipeline.mp4`（仅 `--save-video`）。`--project <dir>` 改输出目录，`--no-save-json` 关闭 JSONL。模型尺寸、置信度等调参项在 [`worker/config/pipeline.yaml`](worker/config/pipeline.yaml)。参数、数据结构与各 runtime 的判定规则见 [worker/README.md](worker/README.md)。
 
 ## 测试
 
