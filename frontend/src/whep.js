@@ -1,7 +1,12 @@
 // Minimal WHEP client for MediaMTX.
 // MediaMTX exposes http://<host>:8889/<path>/whep and expects an SDP offer.
 
-const MEDIA_BASE = `${window.location.protocol}//${window.location.hostname}:8889`
+// VITE_MEDIA_BASE (frontend/.env.local) points the player straight at the GPU
+// box when local forwarding of 8889 is impossible -- Windows reserves the
+// 8844-8943 block for Hyper-V/WSL, so binding 8889 on a dev laptop can fail.
+const MEDIA_BASE =
+  import.meta.env.VITE_MEDIA_BASE ||
+  `${window.location.protocol}//${window.location.hostname}:8889`
 
 function waitForIce(pc, timeoutMs = 1200) {
   if (pc.iceGatheringState === 'complete') return Promise.resolve()

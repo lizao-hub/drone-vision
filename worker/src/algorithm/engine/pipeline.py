@@ -48,6 +48,13 @@ _READY_POLL_S = 0.2
 _RESULT_POLL_S = 0.2
 
 
+# A detector that never ran (failed or empty segment) contributes nothing:
+# the stand-in keeps _assemble free of `if parts.vehicle else None` chains.
+_NO_DETECTION = DetectionDone(
+    role="", seq=-1, slot=-1, detections=(), elapsed_ms=0.0, error=None
+)
+
+
 @dataclass
 class _Parts:
     """What has arrived for one in-flight frame."""
@@ -57,6 +64,16 @@ class _Parts:
     seg: SegmentDone | None = None
     vehicle: DetectionDone | None = None
     line: DetectionDone | None = None
+
+    @property
+    def vehicle_done(self) -> DetectionDone:
+        """The vehicle detector's message, or an empty stand-in if it never ran."""
+        return _NO_DETECTION if self.vehicle is None else self.vehicle
+
+    @property
+    def line_done(self) -> DetectionDone:
+        """The line detector's message, or an empty stand-in if it never ran."""
+        return _NO_DETECTION if self.line is None else self.line
 
     def ready(self) -> bool:
         if self.seg is None:
@@ -163,6 +180,13 @@ class MultiProcessPipeline:
         self._processes: list[_mp.process.BaseProcess] = []
         self._post_thread: threading.Thread | None = None
         self._stop: Any = None
+        # The queues exist only between start() and close(), but close() must
+        # also work on a pipeline that never started, so they are declared
+        # here and start() fills them in.
+        self._q_segment: Any = None
+        self._q_vehicle: Any = None
+        self._q_line: Any = None
+        self._q_out: Any = None
         self._failure: BaseException | None = None
         self._closed = False
 
@@ -184,57 +208,8 @@ class MultiProcessPipeline:
         if height <= 0 or width <= 0:
             raise ValueError("frame geometry must be positive")
         self._height, self._width = int(height), int(width)
-        self._slots = [
-            Slot(height=self._height, width=self._width, mask_capacity=self.mp.mask_capacity)
-            for _ in range(self.window)
-        ]
-        for index in range(self.window):
-            self._free_slots.put(index)
-        self._slot_names = tuple(slot.names for slot in self._slots)
-
-        context = _mp.get_context(_start_method())
-        self._q_segment = context.Queue(maxsize=self.window)
-        self._q_vehicle = context.Queue(maxsize=self.window)
-        self._q_line = context.Queue(maxsize=self.window)
-        self._q_out = context.Queue(maxsize=self.window * 4)
-        self._stop = context.Event()
-
-        def spec(role: str, gpu: int, name: str, q_in: object) -> workers.WorkerSpec:
-            """One worker's inputs; the segment role also feeds both detectors."""
-            segment = role == SEGMENT
-            return workers.WorkerSpec(
-                role=role,
-                gpu=gpu,
-                name=name,
-                settings=self.settings,
-                names=self._slot_names,
-                height=self._height,
-                width=self._width,
-                q_in=q_in,
-                q_out=self._q_out,
-                stop=self._stop,
-                q_vehicle=self._q_vehicle if segment else None,
-                q_line=self._q_line if segment else None,
-                capacity=self.mp.mask_capacity if segment else 0,
-            )
-
-        specs = [
-            spec(SEGMENT, gpu, f"mp-segment-{index}-gpu{gpu}", self._q_segment)
-            for index, gpu in enumerate(self.mp.segment_gpus)
-        ]
-        specs += [
-            spec(role, gpu, f"mp-{role}-gpu{gpu}", queue)
-            for role, gpu, queue in (
-                (VEHICLE, self.mp.vehicle_gpu, self._q_vehicle),
-                (LINE, self.mp.line_gpu, self._q_line),
-            )
-        ]
-        for worker in specs:
-            process = context.Process(
-                target=workers.run_worker, args=(worker,), name=worker.name, daemon=True
-            )
-            process.start()
-            self._processes.append(process)
+        self._allocate_ring()
+        self._spawn_workers()
 
         loading = monotonic()
         warmer = threading.Thread(
@@ -259,6 +234,67 @@ class MultiProcessPipeline:
         )
         self._post_thread.start()
 
+    def _allocate_ring(self) -> None:
+        """The shared-memory slots and the queues that connect the processes."""
+        self._slots = [
+            Slot(height=self._height, width=self._width, mask_capacity=self.mp.mask_capacity)
+            for _ in range(self.window)
+        ]
+        for index in range(self.window):
+            self._free_slots.put(index)
+        self._slot_names = tuple(slot.names for slot in self._slots)
+
+        context = _mp.get_context(_start_method())
+        self._q_segment = context.Queue(maxsize=self.window)
+        self._q_vehicle = context.Queue(maxsize=self.window)
+        self._q_line = context.Queue(maxsize=self.window)
+        self._q_out = context.Queue(maxsize=self.window * 4)
+        self._stop = context.Event()
+
+    def _spawn_workers(self) -> None:
+        """Start one process per spec: the segment roles, then both detectors."""
+        specs = [
+            self._worker_spec(
+                SEGMENT, gpu, f"mp-segment-{index}-gpu{gpu}", self._q_segment
+            )
+            for index, gpu in enumerate(self.mp.segment_gpus)
+        ]
+        specs += [
+            self._worker_spec(role, gpu, f"mp-{role}-gpu{gpu}", queue)
+            for role, gpu, queue in (
+                (VEHICLE, self.mp.vehicle_gpu, self._q_vehicle),
+                (LINE, self.mp.line_gpu, self._q_line),
+            )
+        ]
+        context = _mp.get_context(_start_method())
+        for worker in specs:
+            process = context.Process(
+                target=workers.run_worker, args=(worker,), name=worker.name, daemon=True
+            )
+            process.start()
+            self._processes.append(process)
+
+    def _worker_spec(
+        self, role: str, gpu: int, name: str, q_in: Any
+    ) -> workers.WorkerSpec:
+        """One worker's inputs; the segment role also feeds both detectors."""
+        segment = role == SEGMENT
+        return workers.WorkerSpec(
+            role=role,
+            gpu=gpu,
+            name=name,
+            settings=self.settings,
+            names=self._slot_names,
+            height=self._height,
+            width=self._width,
+            q_in=q_in,
+            q_out=self._q_out,
+            stop=self._stop,
+            q_vehicle=self._q_vehicle if segment else None,
+            q_line=self._q_line if segment else None,
+            capacity=self.mp.mask_capacity if segment else 0,
+        )
+
     def close(self) -> None:
         """Stop the workers, drop in-flight frames and free the shared memory."""
         if self._closed:
@@ -266,12 +302,8 @@ class MultiProcessPipeline:
         self._closed = True
         if self._stop is not None:
             self._stop.set()
-        for queue in (
-            getattr(self, "_q_segment", None),
-            getattr(self, "_q_vehicle", None),
-            getattr(self, "_q_line", None),
-        ):
-            if queue is None:
+        for queue in (self._q_segment, self._q_vehicle, self._q_line):
+            if queue is None:  # never started, or already closed
                 continue
             try:
                 queue.put_nowait(None)
@@ -286,19 +318,22 @@ class MultiProcessPipeline:
         if self._post_thread is not None:
             self._post_thread.join(timeout=5.0)
             self._post_thread = None
-        for name in ("_q_segment", "_q_vehicle", "_q_line", "_q_out"):
-            queue = getattr(self, name, None)
-            if queue is not None:
-                try:
-                    queue.close()
-                    queue.join_thread()
-                except Exception:  # noqa: BLE001
-                    pass
-                setattr(self, name, None)
+        for queue in (self._q_segment, self._q_vehicle, self._q_line, self._q_out):
+            if queue is None:
+                continue
+            try:
+                queue.close()
+                queue.join_thread()
+            except Exception:  # noqa: BLE001
+                pass
+        self._q_segment = self._q_vehicle = self._q_line = self._q_out = None
         for slot in self._slots:
             slot.close_unlink()
         self._slots = []
         self._processes = []
+        with self._order_lock:
+            self._parts.clear()
+            self._order.clear()
 
     # -- frame API ---------------------------------------------------------
     def submit(
@@ -310,14 +345,25 @@ class MultiProcessPipeline:
         generation: int = 0,
     ) -> None:
         """Queue one frame; blocks while ``window`` frames are already in flight."""
-        self._ensure_started(frame)
-        if _frame_error(frame) is not None or (frame.shape[0], frame.shape[1]) != (
+        # One validation pass serves both the start-on-first-submit path and
+        # the geometry check below.
+        problem = _frame_error(frame)
+        if not self.started:
+            if problem is not None:
+                raise ValueError(f"multi-process pipeline needs {problem}")
+            self.start(int(frame.shape[0]), int(frame.shape[1]))
+        if problem is not None or (frame.shape[0], frame.shape[1]) != (
             self._height,
             self._width,
         ):
+            detail = (
+                f"{frame.shape} {frame.dtype}"
+                if isinstance(frame, np.ndarray)
+                else f"a {type(frame).__name__}"
+            )
             raise FrameGeometryChanged(
-                f"frame {frame.shape} {frame.dtype} does not match the started "
-                f"geometry {(self._height, self._width)} uint8"
+                f"frame {detail} does not match the started geometry "
+                f"{(self._height, self._width)} uint8"
             )
         # Acquire the slot before publishing the order: a blocked submit must not
         # leave a half-registered frame behind.
@@ -357,31 +403,28 @@ class MultiProcessPipeline:
         """
         iterator = iter(frames)
         queued: deque[FramePacket] = deque()
-        exhausted = False
         while True:
-            while not exhausted and len(queued) < self.window:
-                packet = next(iterator, None)
-                if packet is None:
-                    exhausted = True
-                    break
-                self.submit(
-                    packet.frame,
-                    timestamp_ms=packet.timestamp_ms,
-                    frame_sequence=packet.frame_index,
-                )
-                queued.append(packet)
+            self._fill(iterator, queued)
             if not queued:
                 return
             observation = self.result()
             yield queued.popleft().frame, observation
 
     # -- internals ---------------------------------------------------------
-    def _ensure_started(self, frame: np.ndarray) -> None:
-        if self.started:
-            return
-        if (problem := _frame_error(frame)) is not None:
-            raise ValueError(f"multi-process pipeline needs {problem}")
-        self.start(int(frame.shape[0]), int(frame.shape[1]))
+    def _fill(
+        self, iterator: Iterator[FramePacket], queued: deque[FramePacket]
+    ) -> None:
+        """Submit packets until ``queued`` holds ``window`` frames or none are left."""
+        while len(queued) < self.window:
+            packet = next(iterator, None)
+            if packet is None:
+                return
+            self.submit(
+                packet.frame,
+                timestamp_ms=packet.timestamp_ms,
+                frame_sequence=packet.frame_index,
+            )
+            queued.append(packet)
 
     def _wait_ready(self) -> None:
         # Roles repeat when several segment workers share the role, so readiness
@@ -412,16 +455,18 @@ class MultiProcessPipeline:
                 raise RuntimeError(f"unexpected startup message {message!r}")
 
     def _post_loop(self) -> None:
+        """Collect worker messages and publish assembled observations in order."""
         while not self._stop.is_set():
             try:
                 message = self._q_out.get(timeout=0.1)
             except _queue.Empty:
                 continue
             if isinstance(message, WorkerFailed):
-                self._failure = RuntimeError(
-                    f"worker {message.role!r} crashed:\n{message.traceback}"
+                self._fail(
+                    RuntimeError(
+                        f"worker {message.role!r} crashed:\n{message.traceback}"
+                    )
                 )
-                self._stop.set()
                 return
             if isinstance(message, SegmentDone):
                 with self._order_lock:
@@ -440,25 +485,28 @@ class MultiProcessPipeline:
                         parts.line = message
             else:  # pragma: no cover - no other message type is sent
                 continue
-            if not self._drain_in_order():
+            try:
+                self._drain_in_order()
+            except BaseException as exc:  # noqa: BLE001 - surfaced through result()
+                self._fail(exc)
                 return
 
-    def _drain_in_order(self) -> bool:
-        """Assemble every leading frame whose parts are complete; ``False`` on error."""
+    def _fail(self, failure: BaseException) -> None:
+        """Record why the pipeline stopped; ``result()`` re-raises it to the caller."""
+        self._failure = failure
+        self._stop.set()
+
+    def _drain_in_order(self) -> None:
+        """Assemble every leading frame whose parts are complete; raises on failure."""
         while True:
             with self._order_lock:
                 if not self._order:
-                    return True
+                    return
                 seq = self._order[0]
                 parts = self._parts[seq]
                 if not parts.ready():
-                    return True
-            try:
-                observation = self._assemble(seq, parts)
-            except BaseException as exc:  # noqa: BLE001 - surfaced through result()
-                self._failure = exc
-                self._stop.set()
-                return False
+                    return
+            observation = self._assemble(seq, parts)
             with self._order_lock:
                 self._order.popleft()
                 del self._parts[seq]
@@ -470,28 +518,25 @@ class MultiProcessPipeline:
         assert parts.seg is not None
         started = perf_counter()
         seg = parts.seg
-        viaduct = self._viaduct(seg)
-        vehicle = parts.vehicle.detections if parts.vehicle else ()
-        line = parts.line.detections if parts.line else ()
-        detect_ms = parts.vehicle.elapsed_ms if parts.vehicle else 0.0
-        line_ms = parts.line.elapsed_ms if parts.line else 0.0
+        vehicle = parts.vehicle_done
+        line = parts.line_done
         stages = StageResult(
-            viaduct=viaduct,
-            vehicle=vehicle,  # type: ignore[arg-type]
-            line=line,  # type: ignore[arg-type]
+            viaduct=self._viaduct(seg),
+            vehicle=vehicle.detections,  # type: ignore[arg-type]
+            line=line.detections,  # type: ignore[arg-type]
             segment_ms=seg.segment_ms,
-            detect_ms=detect_ms,
-            line_ms=line_ms,
+            detect_ms=vehicle.elapsed_ms,
+            line_ms=line.elapsed_ms,
             viaduct_error=_as_error(seg.error),
-            vehicle_error=_as_error(parts.vehicle.error) if parts.vehicle else None,
-            line_error=_as_error(parts.line.error) if parts.line else None,
+            vehicle_error=_as_error(vehicle.error),
+            line_error=_as_error(line.error),
             deck_empty=seg.empty,
         )
         # "processing_ms" is this frame's critical-path work, not its queueing:
         # the same quantity a per-frame (non-pipelined) reader would report.
         processing_ms = (
             seg.segment_ms
-            + max(detect_ms, line_ms)
+            + max(vehicle.elapsed_ms, line.elapsed_ms)
             + (perf_counter() - started) * 1000.0
         )
         return self.assembler.assemble(
