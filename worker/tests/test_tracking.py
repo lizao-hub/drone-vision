@@ -1,4 +1,4 @@
-import pytest
+﻿import pytest
 
 from algorithm.domain.geometry import Box
 from algorithm.domain.observations import DetectedObject
@@ -21,7 +21,7 @@ def _update(tracker: ByteTracker, timestamp_ms: int, detections):
 
 
 def test_identity_is_stable_while_the_vehicle_moves():
-    tracker = ByteTracker(labels=("car",), fps=24)
+    tracker = ByteTracker(labels=("car",))
     ids = []
     for frame in range(3):
         tracks = _update(tracker, frame * FRAME_MS, (_detection("car", 100 + frame * 6, 100),))
@@ -31,7 +31,7 @@ def test_identity_is_stable_while_the_vehicle_moves():
 
 
 def test_each_label_owns_its_identity_namespace():
-    tracker = ByteTracker(labels=("car", "truck"), fps=24)
+    tracker = ByteTracker(labels=("car", "truck"))
     published: list[str] = []
     for timestamp_ms, detection in (
         (0, _detection("car", 100, 100)),
@@ -47,7 +47,7 @@ def test_each_label_owns_its_identity_namespace():
 
 
 def test_weak_detections_keep_identity_but_are_not_published():
-    tracker = ByteTracker(labels=("car",), detection_threshold=0.30, low_threshold=0.10, fps=24)
+    tracker = ByteTracker(labels=("car",), detection_threshold=0.30, low_threshold=0.10)
     strong_first = _update(tracker, 0, (_detection("car", 100, 100, confidence=0.9),))
     weak = _update(tracker, FRAME_MS, (_detection("car", 102, 102, confidence=0.20),))
     strong_again = _update(tracker, 2 * FRAME_MS, (_detection("car", 104, 104, confidence=0.9),))
@@ -58,7 +58,7 @@ def test_weak_detections_keep_identity_but_are_not_published():
 
 
 def test_untracked_labels_are_ignored_not_rejected():
-    tracker = ByteTracker(labels=("car",), fps=24)
+    tracker = ByteTracker(labels=("car",))
     assert _update(tracker, 0, (_detection("bus", 100, 100),)) == ()
     assert _update(tracker, FRAME_MS, (_detection("car", 100, 100),)) == ()
     tracks = _update(tracker, 2 * FRAME_MS, (_detection("car", 100, 100),))
@@ -66,14 +66,14 @@ def test_untracked_labels_are_ignored_not_rejected():
 
 
 def test_timestamps_must_strictly_increase():
-    tracker = ByteTracker(labels=("car",), fps=24)
+    tracker = ByteTracker(labels=("car",))
     _update(tracker, 1000, (_detection("car", 100, 100),))
     with pytest.raises(ValueError):
         _update(tracker, 1000, (_detection("car", 100, 100),))
 
 
 def test_frame_resize_rebuilds_trackers_without_crashing():
-    tracker = ByteTracker(labels=("car",), fps=24)
+    tracker = ByteTracker(labels=("car",))
     _update(tracker, 0, (_detection("car", 100, 100),))
     resized = tracker.update(
         41,

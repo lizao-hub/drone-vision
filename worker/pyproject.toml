@@ -15,7 +15,6 @@ dependencies = [
 # The shell CLI lands with phase 1b; there is no console script until then.
 
 [project.optional-dependencies]
-container = ["imageio-ffmpeg==0.6.0"]
 dev = ["pytest>=8.4", "opencv-python-headless>=4.10"]
 
 [build-system]

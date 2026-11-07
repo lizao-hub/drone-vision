@@ -1,9 +1,9 @@
-"""Offline batch: a video file in, an annotated mp4 (and optional JSONL) out.
+"""Offline batch: a video file in, an annotated mp4 and a JSONL out.
 
-The live counterpart is :mod:`drone_worker.relay`.  Both share the same pipeline,
-runtime and renderer; only the loop around them differs -- this one reads the file
-sequentially at its own pace and exits at the end, the relay drops stale frames
-and never stops until signalled.
+This is the only entry point: it reads the file sequentially at its own pace,
+runs the shared pipeline, and exits at the end of the file.  Every tuning knob
+comes from ``PipelineSettings``; the flags here only choose the input, where the
+two outputs go, and whether each of them is written.
 """
 
 from __future__ import annotations
@@ -17,17 +17,12 @@ from typing import Sequence
 
 import cv2
 
+from algorithm.config import DEFAULT_SETTINGS
 from algorithm.domain.vehicle_speed_runtime import VehicleSpeedRuntime
 from algorithm.domain.viaduct_runtime import ViaductRuntime
-from algorithm.runtime.factory import (
-    DEFAULT_VIDEO,
-    WORKER_ROOT,
-    build_pipeline,
-    default_settings,
-)
+from algorithm.runtime.factory import build_pipeline
 from algorithm.runtime.snapshots import record
-from algorithm.runtime.sources import VideoFileSource
-from drone_worker.args import parse_device
+from algorithm.runtime.sources import FileSequenceSource
 from drone_worker.render import annotate
 
 
@@ -35,52 +30,51 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="python -m drone_worker",
         description="Segment the viaduct deck, black out the rest, track vehicles on it.",
-        epilog="For the live relay use: python -m drone_worker relay --source <rtsp> --dest <rtmp>",
     )
-    parser.add_argument("--video", type=Path, default=DEFAULT_VIDEO)
-    parser.add_argument("--output", type=Path, default=None)
-    parser.add_argument("--device", default="0", help="integer GPU index or 'cpu'")
-    parser.add_argument("--segment-imgsz", type=int, default=960)
-    parser.add_argument("--detect-imgsz", type=int, default=640)
-    parser.add_argument("--line-imgsz", type=int, default=640)
-    parser.add_argument("--viaduct-conf", type=float, default=0.25)
-    parser.add_argument("--vehicle-conf", type=float, default=0.30)
-    parser.add_argument("--line-conf", type=float, default=0.30)
-    parser.add_argument("--stride", type=int, default=3,
-                        help="run inference on every Nth frame; one Observation/JSON line per sampled frame (default: 3)")
-    parser.add_argument("--max-frames", type=int, default=0,
-                        help="stop after N sampled frames")
+    parser.add_argument("--source", type=Path, required=True, help="source video file")
+    parser.add_argument(
+        "--stride",
+        type=int,
+        default=3,
+        help="run inference on every Nth frame; one Observation/JSON line per sampled frame (default: 3)",
+    )
     parser.add_argument("--log-every", type=int, default=50)
-    parser.add_argument("--json", type=Path, default=None, help="optional JSONL output")
-    parser.add_argument("--car-width-m", type=float, default=1.95,
-                        help="real width of a car, used to scale pixels to metres (default: 1.95)")
-    parser.add_argument("--no-video", action="store_true", help="skip the annotated mp4")
+    parser.add_argument(
+        "--save-video",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="write the annotated mp4 (default: on)",
+    )
+    parser.add_argument(
+        "--save-json",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="write the per-frame JSONL (default: on)",
+    )
     args = parser.parse_args(argv)
-    if args.stride < 1:
-        parser.error("--stride must be a positive integer")
     return args
 
 
 def main_batch(argv: Sequence[str] | None = None) -> int:
     args = _parse_args(argv)
-    video = args.video.resolve()
-    output = args.output or WORKER_ROOT / "output" / f"{video.stem}_pipeline.mp4"
-    output.parent.mkdir(parents=True, exist_ok=True)
+    settings = DEFAULT_SETTINGS
+    input_path = args.source.resolve()
+    if not input_path.is_file():
+        raise FileNotFoundError(f"source does not exist: {input_path}")
+    # Both outputs go to the configured project directory; there is no flag for
+    # it, because changing it is a settings change, not a per-run choice.
+    project = settings.project
+    project.mkdir(parents=True, exist_ok=True)
+    annotated_path = project / f"{input_path.stem}_pipeline.mp4"
+    json_path = project / f"{input_path.stem}.jsonl"
 
-    settings = default_settings(
-        device=parse_device(args.device),
-        segment_imgsz=args.segment_imgsz,
-        detect_imgsz=args.detect_imgsz,
-        line_imgsz=args.line_imgsz,
-        viaduct_confidence=args.viaduct_conf,
-        vehicle_confidence=args.vehicle_conf,
-        line_confidence=args.line_conf,
-        car_width_m=args.car_width_m,
+    source = FileSequenceSource(
+        [input_path],
+        frame_stride=args.stride,
+        realtime=False,
     )
-
-    source = VideoFileSource(video, stride=args.stride)
     source.open()
-    pipeline = build_pipeline(settings, fps=source.fps)
+    pipeline = build_pipeline(settings)
     viaduct_runtime = ViaductRuntime(
         speed=VehicleSpeedRuntime(
             frame_width=source.width,
@@ -89,15 +83,15 @@ def main_batch(argv: Sequence[str] | None = None) -> int:
         )
     )
     writer: cv2.VideoWriter | None = None
-    if not args.no_video:
+    if args.save_video:
         writer = cv2.VideoWriter(
-            str(output),
+            str(annotated_path),
             cv2.VideoWriter_fourcc(*"mp4v"),
             max(source.fps / args.stride, 1.0),
             (source.width, source.height),
         )
         if not writer.isOpened():
-            raise RuntimeError(f"cannot open video writer: {output}")
+            raise RuntimeError(f"cannot open video writer: {annotated_path}")
 
     processed = 0
     valid = 0
@@ -116,10 +110,7 @@ def main_batch(argv: Sequence[str] | None = None) -> int:
     deck_densities: dict[str, list[float]] = {}
     deck_speeds: dict[str, list[float]] = {}
     deck_congestion: dict[str, Counter[str]] = {}
-    json_stream = None
-    if args.json is not None:
-        args.json.parent.mkdir(parents=True, exist_ok=True)
-        json_stream = args.json.open("w", encoding="utf-8")
+    json_stream = json_path.open("w", encoding="utf-8") if args.save_json else None
     started_at = time.perf_counter()
 
     try:
@@ -127,8 +118,10 @@ def main_batch(argv: Sequence[str] | None = None) -> int:
             packet = source.read()
             if packet is None:
                 break
+            if not packet.inference_eligible:
+                continue
             observation = pipeline.process(
-                packet.frame,
+                packet.image,
                 packet.timestamp_ms,
                 packet.frame_index,
             )
@@ -181,7 +174,7 @@ def main_batch(argv: Sequence[str] | None = None) -> int:
             if writer is not None:
                 writer.write(
                     annotate(
-                        packet.frame,
+                        packet.image,
                         observation,
                         viaduct=viaduct,
                     )
@@ -194,8 +187,6 @@ def main_batch(argv: Sequence[str] | None = None) -> int:
                     )
                     + "\n"
                 )
-            if args.max_frames and processed >= args.max_frames:
-                break
             if args.log_every and processed % args.log_every == 0:
                 print(
                     f"[{processed}/{source.frame_count or '?'}] valid={valid} "
@@ -258,11 +249,12 @@ def main_batch(argv: Sequence[str] | None = None) -> int:
             + ", ".join(f"{key}:{value}" for key, value in sorted(viaduct_reasons.items()))
         )
     if writer is not None:
-        print(f"video: {output}")
-    if args.json is not None:
-        print(f"jsonl: {args.json}")
+        print(f"video: {annotated_path}")
+    if json_stream is not None:
+        print(f"jsonl: {json_path}")
     return 0
 
 
 def _mean(values: list[float]) -> float:
     return sum(values) / len(values)
+

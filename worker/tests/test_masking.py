@@ -3,7 +3,7 @@ import pytest
 
 from algorithm.domain.geometry import Box, Mask
 from algorithm.domain.observations import DetectedObject
-from algorithm.perception.masking import apply_mask, union_mask
+from algorithm.perception.masking import blackout_off_deck
 
 
 def _detection(mask: np.ndarray, confidence: float = 0.9) -> DetectedObject:
@@ -18,67 +18,66 @@ def _detection(mask: np.ndarray, confidence: float = 0.9) -> DetectedObject:
     return DetectedObject(label="viaduct", confidence=confidence, box=box, mask=Mask(mask))
 
 
-def test_union_merges_every_instance():
+def _frame(height: int = 4, width: int = 6) -> np.ndarray:
+    return np.full((height, width, 3), 255, dtype=np.uint8)
+
+
+def test_every_instance_keeps_its_pixels():
     left = np.zeros((4, 6), dtype=np.bool_)
     left[:, :3] = True
     right = np.zeros((4, 6), dtype=np.bool_)
     right[:, 3:] = True
-    merged = union_mask((_detection(left), _detection(right)), height=4, width=6)
-    assert merged.data.all()
+
+    masked = blackout_off_deck(_frame(), (_detection(left), _detection(right)))
+
     # Taking only the most confident instance would black out half the road.
+    assert (masked == 255).all()
 
 
-def test_union_does_not_filter_by_confidence():
-    # Filtering happens once in the pipeline; the union must not drop again.
+def test_confidence_does_not_filter_instances_off():
+    # Filtering happens once in the pipeline; the blackout must not drop again.
     mask = np.zeros((4, 6), dtype=np.bool_)
     mask[1, 1] = True
-    merged = union_mask((_detection(mask, confidence=0.01),), height=4, width=6)
-    assert merged.data.sum() == 1
+
+    masked = blackout_off_deck(_frame(), (_detection(mask, confidence=0.01),))
+
+    assert int(masked[1, 1, 0]) == 255
+    assert int(masked.sum()) == 255 * 3
 
 
-def test_union_of_no_instances_is_empty():
-    assert not union_mask((), height=4, width=6).data.any()
+def test_no_instances_yields_no_image():
+    assert blackout_off_deck(_frame(), ()) is None
 
 
-def test_union_rejects_geometry_mismatch():
+def test_empty_masks_yield_no_image():
+    mask = np.zeros((4, 6), dtype=np.bool_)
+    instance = DetectedObject(
+        label="viaduct", confidence=0.9, box=Box(0.0, 0.0, 1.0, 1.0), mask=Mask(mask)
+    )
+    assert blackout_off_deck(_frame(), (instance,)) is None
+
+
+def test_geometry_mismatch_is_rejected():
     mask = np.zeros((3, 6), dtype=np.bool_)
     mask[1, 1] = True
     with pytest.raises(ValueError):
-        union_mask((_detection(mask),), height=4, width=6)
+        blackout_off_deck(_frame(), (_detection(mask),))
 
 
-def test_union_requires_a_mask_on_every_instance():
+def test_every_instance_must_carry_a_mask():
     without_mask = DetectedObject(
         label="viaduct", confidence=0.9, box=Box(0.1, 0.1, 0.2, 0.2)
     )
     with pytest.raises(ValueError):
-        union_mask((without_mask,), height=4, width=6)
+        blackout_off_deck(_frame(), (without_mask,))
 
 
-def test_apply_mask_blacks_out_everything_off_the_deck():
-    mask = Mask(np.array([[True, False, False], [True, True, False]], dtype=np.bool_))
+def test_off_deck_pixels_are_blacked_out_in_a_copy():
+    mask = np.array([[True, False, False], [True, True, False]], dtype=np.bool_)
     frame = np.full((2, 3, 3), 255, dtype=np.uint8)
-    masked = apply_mask(frame, mask)
-    assert (masked[mask.data] == 255).all()
-    assert (masked[~mask.data] == 0).all()
-    assert (frame == 255).all()
 
+    masked = blackout_off_deck(frame, (_detection(mask),))
 
-def test_apply_mask_fills_a_reused_buffer_in_place():
-    mask = Mask(np.array([[True, False], [False, False]], dtype=np.bool_))
-    frame = np.full((2, 2, 3), 200, dtype=np.uint8)
-    buffer = np.empty_like(frame)
-
-    masked = apply_mask(frame, mask, out=buffer)
-
-    assert masked is buffer
-    assert int(masked[0, 0, 0]) == 200
-    assert int(masked[1, 1, 2]) == 0
-    assert int(frame[1, 1, 2]) == 200  # the source frame is never touched
-
-
-def test_apply_mask_rejects_a_buffer_of_the_wrong_shape():
-    mask = Mask(np.ones((2, 2), dtype=np.bool_))
-    frame = np.zeros((2, 2, 3), dtype=np.uint8)
-    with pytest.raises(ValueError):
-        apply_mask(frame, mask, out=np.empty((3, 3, 3), dtype=np.uint8))
+    assert (masked[mask] == 255).all()
+    assert (masked[~mask] == 0).all()
+    assert (frame == 255).all()  # the source frame is never touched

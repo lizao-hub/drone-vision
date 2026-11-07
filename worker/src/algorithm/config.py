@@ -1,4 +1,7 @@
-"""Pipeline tuning knobs.  Plain immutable data: no I/O, no model handles."""
+"""Pipeline settings: the one place every tuning value and bundled path lives.
+
+Plain immutable data: no I/O, no model handles.
+"""
 
 from __future__ import annotations
 
@@ -6,12 +9,19 @@ from dataclasses import dataclass
 from math import isfinite
 from pathlib import Path
 
+# # .../worker/src/algorithm/config.py -> worker/
+WORKER_ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_VIADUCT_WEIGHT = WORKER_ROOT / "models" / "viaduct" / "weights" / "best.pt"
+DEFAULT_VEHICLE_WEIGHT = WORKER_ROOT / "models" / "vehicle" / "weights" / "best.pt"
+DEFAULT_LINE_WEIGHT = WORKER_ROOT / "models" / "line" / "weights" / "best.pt"
+
 
 @dataclass(frozen=True, slots=True)
 class PipelineSettings:
     viaduct_weight: Path
     vehicle_weight: Path
     line_weight: Path
+    project: Path = WORKER_ROOT / "output"
     device: int | str = 0
     segment_imgsz: int = 960
     detect_imgsz: int = 640
@@ -29,7 +39,7 @@ class PipelineSettings:
     car_width_m: float = 1.95
 
     def __post_init__(self) -> None:
-        for name in ("viaduct_weight", "vehicle_weight", "line_weight"):
+        for name in ("viaduct_weight", "vehicle_weight", "line_weight", "project"):
             if not isinstance(getattr(self, name), Path):
                 raise TypeError(f"{name} must be a pathlib.Path")
         if isinstance(self.device, bool) or not isinstance(self.device, (int, str)):
@@ -60,3 +70,13 @@ class PipelineSettings:
             raise ValueError("line_confidence must be within (0, 1]")
         if not isfinite(self.car_width_m) or self.car_width_m <= 0.0:
             raise ValueError("car_width_m must be finite and positive")
+
+
+
+# The only deployment-dependent part of the settings; every knob keeps the
+# default declared above.
+DEFAULT_SETTINGS = PipelineSettings(
+    viaduct_weight=DEFAULT_VIADUCT_WEIGHT,
+    vehicle_weight=DEFAULT_VEHICLE_WEIGHT,
+    line_weight=DEFAULT_LINE_WEIGHT,
+)

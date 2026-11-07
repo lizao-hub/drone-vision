@@ -25,6 +25,12 @@ from algorithm.domain.observations import DetectedObject, TrackedObject
 VEHICLE_LABELS: tuple[str, ...] = ("car",)
 LINE_LABELS: tuple[str, ...] = ("line",)
 
+# The library wants its lost-track buffer as a frame count, but tracks here are
+# expired by source time (`max_lost_ms`), so the buffer only has to be long
+# enough that the library never drops a track before that.  Sizing it for a
+# fast source costs nothing and keeps this class free of an fps parameter.
+_MAX_TRACK_RATE_FPS = 120.0
+
 
 class ByteTracker:
     def __init__(
@@ -34,7 +40,6 @@ class ByteTracker:
         detection_threshold: float = 0.30,
         low_threshold: float = 0.10,
         max_lost_ms: int = 1000,
-        fps: float = 24.0,
         match_threshold: float = 0.80,
         new_track_threshold: float | None = None,
     ) -> None:
@@ -44,15 +49,12 @@ class ByteTracker:
             raise ValueError("thresholds must satisfy 0 < low <= detection <= 1")
         if max_lost_ms <= 0:
             raise ValueError("max_lost_ms must be positive")
-        if fps <= 0:
-            raise ValueError("fps must be positive")
         if not 0.0 < match_threshold <= 1.0:
             raise ValueError("match_threshold must be within (0, 1]")
         self.labels = tuple(labels)
         self.detection_threshold = detection_threshold
         self.low_threshold = low_threshold
         self.max_lost_ms = max_lost_ms
-        self.fps = fps
         self.match_threshold = match_threshold
         self.new_track_threshold = (
             detection_threshold if new_track_threshold is None else new_track_threshold
@@ -115,7 +117,7 @@ class ByteTracker:
         from ultralytics.trackers.byte_tracker import BYTETracker  # type: ignore[import-not-found]
 
         self._width, self._height = width, height
-        buffer_frames = max(1, ceil(self.max_lost_ms * self.fps / 1000.0))
+        buffer_frames = max(1, ceil(self.max_lost_ms * _MAX_TRACK_RATE_FPS / 1000.0))
         self._trackers = {
             label: BYTETracker(self._args(buffer_frames)) for label in self.labels
         }

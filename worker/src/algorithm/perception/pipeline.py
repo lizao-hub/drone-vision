@@ -13,8 +13,7 @@ from algorithm.domain.observations import (
     Observation,
     TrackedObject,
 )
-from algorithm.perception.masking import apply_mask, union_mask
-from algorithm.perception.viaduct_tracker import ViaductTracker
+from algorithm.perception.masking import blackout_off_deck
 
 
 class SegmentationPredictor(Protocol):
@@ -24,6 +23,7 @@ class SegmentationPredictor(Protocol):
 class DetectionPredictor(Protocol):
     def predict(self, frame: np.ndarray) -> tuple[DetectedObject, ...]: ...
 
+from algorithm.perception.viaduct_tracker import ViaductTracker
 
 class Tracker(Protocol):
     def update(
@@ -70,9 +70,6 @@ class ObservationPipeline:
         self.line_tracker = line_tracker
         self.viaduct_tracker = viaduct_tracker
         self.mask_min_confidence = mask_min_confidence
-        # Reused blackout buffer: the masked frame only lives for this call, and
-        # allocating 6 MB per frame is measurable at 1080p.
-        self._masked: np.ndarray | None = None
 
     def process(
         self,
@@ -129,10 +126,11 @@ class ObservationPipeline:
                 segment_ms=segment_ms,
             )
 
-        # Step 3: merge every instance into the one region used for blackout.
-        mask = union_mask(viaduct, height=height, width=width)
+        # Step 3: merge every instance into the one masked image the detectors
+        # see. Nothing off the deck survives, so no post-filter is needed later.
+        masked = blackout_off_deck(frame, viaduct)
 
-        if not mask.data.any():
+        if masked is None:
             return Observation(
                 timestamp_ms=timestamp_ms,
                 frame_sequence=frame_sequence,
@@ -152,14 +150,7 @@ class ObservationPipeline:
                 ),
             )
 
-        # Step 4: blacken everything off the deck, then detect on that image.
-        if (
-            self._masked is None
-            or self._masked.shape != frame.shape
-            or self._masked.dtype != frame.dtype
-        ):
-            self._masked = np.empty_like(frame)
-        masked = apply_mask(frame, mask, out=self._masked)
+        # Step 4: detect vehicles on the masked image.
         detect_started = perf_counter()
         try:
             vehicle = self.vehicle_detection.predict(masked)

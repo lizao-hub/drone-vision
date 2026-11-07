@@ -1,35 +1,42 @@
-"""JSONL-ready snapshots: domain values in, plain JSON types out."""
+"""JSONL-ready snapshots: domain values in, plain JSON types out.
+
+The shape is an explicit projection, not a generic dump: masks are dropped, a
+box becomes ``x/y/width/height``, and floats are rounded so one JSONL line
+stays readable.
+"""
 
 from __future__ import annotations
 
+from dataclasses import asdict
 from typing import Any
 
 from algorithm.domain.geometry import Box
-from algorithm.domain.observations import DetectedObject, Observation, TrackedObject
+from algorithm.domain.observations import (
+    DetectedObject,
+    Diagnostics,
+    Observation,
+    TrackedObject,
+)
 from algorithm.domain.viaduct_runtime import ViaductUpdate
 
 
 def record(observation: Observation, viaduct: ViaductUpdate) -> dict[str, Any]:
     """One frame's observation plus the deck statistics, ready for ``json.dumps``."""
-    car_speeds = viaduct.speed
+    speeds = viaduct.speed
     return {
         "timestamp_ms": observation.timestamp_ms,
         "frame_sequence": observation.frame_sequence,
         "frame_valid": observation.frame_valid,
         "viaduct": [_detection(item) for item in observation.viaduct],
-        "viaduct_tracks": [
-            _tracked(track) for track in observation.viaduct_tracks
-        ],
+        "viaduct_tracks": [_tracked(track) for track in observation.viaduct_tracks],
         "vehicle": [_detection(item) for item in observation.vehicle],
         "vehicle_tracks": [_tracked(track) for track in observation.vehicle_tracks],
         "line_tracks": [_tracked(track) for track in observation.line_tracks],
         "unknown_reasons": list(observation.unknown_reasons),
         "vehicle_speeds": {
-            "valid": car_speeds.valid,
-            "reasons": list(car_speeds.reasons),
-            "scale_px": None
-            if car_speeds.scale_px is None
-            else round(car_speeds.scale_px, 3),
+            "valid": speeds.valid,
+            "reasons": list(speeds.reasons),
+            "scale_px": _rounded(speeds.scale_px, 3),
             "vehicles": [
                 {
                     "track_id": item.track_id,
@@ -37,7 +44,7 @@ def record(observation: Observation, viaduct: ViaductUpdate) -> dict[str, Any]:
                     "speed_mps": round(item.speed_mps, 4),
                     "speed_kmh": round(item.speed_kmh, 3),
                 }
-                for item in car_speeds.speeds
+                for item in speeds.speeds
             ],
         },
         "viaduct_stats": {
@@ -47,34 +54,24 @@ def record(observation: Observation, viaduct: ViaductUpdate) -> dict[str, Any]:
                 {
                     "deck_id": item.deck_id,
                     "density": round(item.density, 5),
-                    "mean_speed_mps": None
-                    if item.mean_speed_mps is None
-                    else round(item.mean_speed_mps, 4),
-                    "mean_speed_kmh": None
-                    if item.mean_speed_kmh is None
-                    else round(item.mean_speed_kmh, 3),
+                    "mean_speed_mps": _rounded(item.mean_speed_mps, 4),
+                    "mean_speed_kmh": _rounded(item.mean_speed_kmh, 3),
                     "vehicles": item.vehicles,
                     "congestion": item.congestion.value,
                 }
                 for item in viaduct.decks
             ],
         },
-        "diagnostics": {
-            "segment_ms": round(observation.diagnostics.segment_ms, 2),
-            "detect_ms": round(observation.diagnostics.detect_ms, 2),
-            "line_ms": round(observation.diagnostics.line_ms, 2),
-            "processing_ms": round(observation.diagnostics.processing_ms, 2),
-        },
+        "diagnostics": _diagnostics(observation.diagnostics),
     }
 
 
-def _tracked(track: TrackedObject) -> dict[str, Any]:
-    return {
-        "track_id": track.track_id,
-        "label": track.label,
-        "confidence": round(track.confidence, 4),
-        "box": _box(track.box),
-    }
+def _rounded(value: float | None, digits: int) -> float | None:
+    return None if value is None else round(value, digits)
+
+
+def _diagnostics(diagnostics: Diagnostics) -> dict[str, float]:
+    return {name: round(value, 2) for name, value in asdict(diagnostics).items()}
 
 
 def _detection(item: DetectedObject) -> dict[str, Any]:
@@ -83,6 +80,10 @@ def _detection(item: DetectedObject) -> dict[str, Any]:
         "confidence": round(item.confidence, 4),
         "box": _box(item.box),
     }
+
+
+def _tracked(track: TrackedObject) -> dict[str, Any]:
+    return {"track_id": track.track_id, **_detection(track)}
 
 
 def _box(box: Box) -> dict[str, float]:
