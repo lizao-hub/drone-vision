@@ -1,0 +1,62 @@
+# MediaMTX 1.21.x 最小配置（只服务原画链路）。
+# 完整默认项参考：
+# https://github.com/bluenviron/mediamtx/blob/v1.21.3/mediamtx.yml
+#
+# 镜像会把本文件挂到 /mediamtx.yml。
+
+logLevel: info
+
+# 本地演示：允许匿名发布/读取；API/metrics 仅本机可访问。
+# 生产环境必须改成鉴权用户/Token。
+authMethod: internal
+authInternalUsers:
+  - user: any
+    pass:
+    ips: []
+    permissions:
+      - action: publish
+        path:
+      - action: read
+        path:
+      - action: playback
+        path:
+  - user: any
+    pass:
+    ips: ["127.0.0.1", "::1"]
+    permissions:
+      - action: api
+      - action: metrics
+
+# 控制 API / 指标：方便用 curl 查流是否在线；默认只允许本机访问。
+api: true
+apiAddress: :9997
+metrics: true
+metricsAddress: :9998
+
+# RTMP 入，RTSP/HLS/WebRTC 出。
+rtsp: true
+rtspAddress: :8554
+rtmp: true
+rtmpAddress: :1935
+
+hls: true
+hlsAddress: :8888
+hlsVariant: lowLatency
+hlsPartDuration: 200ms
+
+webrtc: true
+webrtcAddress: :8889
+webrtcLocalUDPAddress: :8189
+# WSL2 下 localhost 不转发 UDP，开启 TCP 8189 作为兜底。
+webrtcLocalTCPAddress: :8189
+# 同时广播 WSL 网卡 IP（UDP）和 127.0.0.1（TCP 兜底）。
+webrtcIPsFromInterfaces: true
+webrtcAdditionalHosts: [127.0.0.1]
+webrtcAllowOrigins: ["*"]
+
+pathDefaults:
+  # 流由 Windows FFmpeg 通过 RTMP 推送。
+  source: publisher
+
+paths:
+  all_others:
