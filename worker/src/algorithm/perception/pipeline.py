@@ -3,38 +3,20 @@
 from __future__ import annotations
 
 from time import perf_counter
-from typing import Protocol
 
 import numpy as np
 
-from algorithm.domain.observations import (
-    DetectedObject,
-    Diagnostics,
-    Observation,
-    TrackedObject,
-)
+from algorithm.domain.observations import Diagnostics, Observation
 from algorithm.perception.masking import blackout_off_deck
-
-
-class SegmentationPredictor(Protocol):
-    def predict(self, frame: np.ndarray) -> tuple[DetectedObject, ...]: ...
-
-
-class DetectionPredictor(Protocol):
-    def predict(self, frame: np.ndarray) -> tuple[DetectedObject, ...]: ...
-
+from algorithm.perception.stages import (
+    DetectionPredictor,
+    DetectStage,
+    SegmentationPredictor,
+    SegmentStage,
+    Tracker,
+    TrackStage,
+)
 from algorithm.perception.viaduct_tracker import ViaductTracker
-
-class Tracker(Protocol):
-    def update(
-        self,
-        timestamp_ms: int,
-        detections: tuple[DetectedObject, ...],
-        *,
-        width: int,
-        height: int,
-        generation: int = 0,
-    ) -> tuple[TrackedObject, ...]: ...
 
 
 class ObservationPipeline:
@@ -61,15 +43,17 @@ class ObservationPipeline:
         viaduct_tracker: ViaductTracker,
         mask_min_confidence: float = 0.25,
     ) -> None:
-        if not 0.0 <= mask_min_confidence <= 1.0:
-            raise ValueError("mask_min_confidence must be within [0, 1]")
-        self.viaduct_segment = viaduct_segment
-        self.vehicle_detection = vehicle_detection
-        self.vehicle_tracker = vehicle_tracker
-        self.line_detection = line_detection
-        self.line_tracker = line_tracker
-        self.viaduct_tracker = viaduct_tracker
-        self.mask_min_confidence = mask_min_confidence
+        # The stage objects own the models and the trackers; the pipeline is
+        # only the order they run in, which is what the split path reuses.
+        self.segment = SegmentStage(
+            viaduct_segment, mask_min_confidence=mask_min_confidence
+        )
+        self.detect = DetectStage(vehicle_detection, line_detection)
+        self.track = TrackStage(
+            viaduct_tracker=viaduct_tracker,
+            vehicle_tracker=vehicle_tracker,
+            line_tracker=line_tracker,
+        )
 
     def process(
         self,
@@ -92,7 +76,7 @@ class ObservationPipeline:
         # Step 1: viaduct segmentation. A backend failure voids the frame.
         segment_started = perf_counter()
         try:
-            viaduct_segmentations = self.viaduct_segment.predict(frame)
+            viaduct = self.segment.predict(frame)
         except Exception:  # noqa: BLE001 - third-party runtimes raise their own types
             return self._invalid(
                 timestamp_ms,
@@ -104,18 +88,10 @@ class ObservationPipeline:
             )
         segment_ms = (perf_counter() - segment_started) * 1000.0
 
-        # Every instance keeps its own mask in the observation; the union below
-        # is only the derived region used for blackout and detection.
-        viaduct = tuple(
-            item
-            for item in viaduct_segmentations
-            if item.confidence >= self.mask_min_confidence
-        )
-
         # Step 2: give each instance a deck id that survives frame-to-frame
         # instance reordering. A tracker failure voids the frame like a model one.
         try:
-            viaduct_tracks = self.viaduct_tracker.update(timestamp_ms, viaduct)
+            viaduct_tracks = self.track.viaduct(timestamp_ms, viaduct)
         except Exception:  # noqa: BLE001
             return self._invalid(
                 timestamp_ms,
@@ -153,7 +129,7 @@ class ObservationPipeline:
         # Step 4: detect vehicles on the masked image.
         detect_started = perf_counter()
         try:
-            vehicle = self.vehicle_detection.predict(masked)
+            vehicle = self.detect.vehicles(masked)
         except Exception:  # noqa: BLE001
             return self._invalid(
                 timestamp_ms,
@@ -168,7 +144,7 @@ class ObservationPipeline:
 
         # Step 5: assign vehicle identities.
         try:
-            vehicle_tracks = self.vehicle_tracker.update(
+            vehicle_tracks = self.track.vehicles(
                 timestamp_ms,
                 vehicle,
                 width=width,
@@ -189,7 +165,7 @@ class ObservationPipeline:
         # Step 6: lane markings on the same blacked-out image, then track them.
         line_started = perf_counter()
         try:
-            line = self.line_detection.predict(masked)
+            line = self.detect.lines(masked)
         except Exception:  # noqa: BLE001
             return self._invalid(
                 timestamp_ms,
@@ -203,7 +179,7 @@ class ObservationPipeline:
             )
         line_ms = (perf_counter() - line_started) * 1000.0
         try:
-            line_tracks = self.line_tracker.update(
+            line_tracks = self.track.lines(
                 timestamp_ms,
                 line,
                 width=width,
@@ -253,21 +229,49 @@ class ObservationPipeline:
         detect_ms: float = 0.0,
         line_ms: float = 0.0,
     ) -> Observation:
-        return Observation(
-            timestamp_ms=timestamp_ms,
-            frame_sequence=frame_sequence,
-            generation=generation,
-            frame_valid=False,
-            viaduct=(),
-            viaduct_tracks=(),
-            vehicle=(),
-            vehicle_tracks=(),
-            line_tracks=(),
-            unknown_reasons=unknown_reasons,
-            diagnostics=Diagnostics(
-                segment_ms=segment_ms,
-                detect_ms=detect_ms,
-                line_ms=line_ms,
-                processing_ms=(perf_counter() - started) * 1000.0,
-            ),
+        return invalid_observation(
+            timestamp_ms,
+            frame_sequence,
+            generation,
+            unknown_reasons,
+            processing_ms=(perf_counter() - started) * 1000.0,
+            segment_ms=segment_ms,
+            detect_ms=detect_ms,
+            line_ms=line_ms,
         )
+
+
+def invalid_observation(
+    timestamp_ms: int,
+    frame_sequence: int,
+    generation: int,
+    unknown_reasons: tuple[str, ...],
+    *,
+    processing_ms: float,
+    segment_ms: float = 0.0,
+    detect_ms: float = 0.0,
+    line_ms: float = 0.0,
+) -> Observation:
+    """One frame's verdict when a stage failed.
+
+    Shared with the split pipeline's coordinator: an invalid frame must look the
+    same whichever topology produced it.
+    """
+    return Observation(
+        timestamp_ms=timestamp_ms,
+        frame_sequence=frame_sequence,
+        generation=generation,
+        frame_valid=False,
+        viaduct=(),
+        viaduct_tracks=(),
+        vehicle=(),
+        vehicle_tracks=(),
+        line_tracks=(),
+        unknown_reasons=unknown_reasons,
+        diagnostics=Diagnostics(
+            segment_ms=segment_ms,
+            detect_ms=detect_ms,
+            line_ms=line_ms,
+            processing_ms=processing_ms,
+        ),
+    )

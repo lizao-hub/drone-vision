@@ -30,6 +30,14 @@ class PipelineSettings:
     # Where the batch runner writes the annotated mp4 and the JSONL.
     project: Path = WORKER_ROOT / "output"
     device: int | str = 0
+    # Split-pipeline card assignment: the first entry segments, the rest detect.
+    # Empty means "use `device` everywhere", so a single-card machine needs no
+    # new setting and the serial path keeps working unchanged.
+    devices: tuple[int, ...] = ()
+    # Depth of the frame/mask rings in the split pipeline.  Five is what keeps
+    # both cards busy: one frame in the segmenter, one in the detector, one
+    # queued for the detector, one being filled -- plus one of slack.
+    shm_slots: int = 5
     # All three models were trained at 1280; a 1080p 16:9 frame becomes 1280x736
     # under rect letterboxing.  Keeping inference at the training size keeps the
     # apparent object scale identical between training and deployment.
@@ -54,6 +62,21 @@ class PipelineSettings:
                 raise TypeError(f"{name} must be a pathlib.Path")
         if isinstance(self.device, bool) or not isinstance(self.device, (int, str)):
             raise TypeError("device must be an int index or a string such as 'cpu'")
+        if not isinstance(self.devices, tuple):
+            raise TypeError("devices must be a tuple of GPU indices")
+        for index in self.devices:
+            if isinstance(index, bool) or not isinstance(index, int) or index < 0:
+                raise ValueError("devices must hold non-negative integer GPU indices")
+        if self.devices and len(self.devices) != 2:
+            raise ValueError(
+                "devices must name exactly two cards: segmentation first, detection second"
+            )
+        if (
+            isinstance(self.shm_slots, bool)
+            or not isinstance(self.shm_slots, int)
+            or self.shm_slots <= 0
+        ):
+            raise ValueError("shm_slots must be a positive integer")
         for name in ("segment_imgsz", "detect_imgsz", "line_imgsz"):
             if isinstance(getattr(self, name), bool) or getattr(self, name) <= 0:
                 raise ValueError(f"{name} must be a positive integer")

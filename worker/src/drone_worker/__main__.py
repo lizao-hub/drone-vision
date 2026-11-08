@@ -1,7 +1,8 @@
-"""Entry point: ``python -m drone_worker [batch] [args]``.
+"""Entry point: ``python -m drone_worker [batch|pipeline|relay] [args]``.
 
-``batch`` is the only mode left, so the prefix is accepted and dropped; it stays
-supported because existing commands spell it out.
+No subcommand means ``batch``, which is also still accepted spelled out because
+existing commands do.  ``relay`` is the live path: RTSP in, annotated RTMP out,
+over the same serial pipeline.
 """
 
 from __future__ import annotations
@@ -12,6 +13,14 @@ from typing import Sequence
 
 def main(argv: Sequence[str] | None = None) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
+    if arguments[:1] == ["pipeline"]:
+        from drone_worker.parallel import main_parallel
+
+        return main_parallel(arguments[1:])
+    if arguments[:1] == ["relay"]:
+        from drone_worker.relay import main_relay
+
+        return main_relay(arguments[1:])
     if arguments[:1] == ["batch"]:
         arguments = arguments[1:]
     from drone_worker.batch import main_batch

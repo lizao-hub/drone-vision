@@ -1,0 +1,13 @@
+.venv
+__pycache__
+*.py[cod]
+.pytest_cache
+.ruff_cache
+models
+videos
+output
+out
+tests
+img.png
+AGENTS.md
+*.mp4

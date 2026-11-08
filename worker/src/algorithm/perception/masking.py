@@ -46,9 +46,25 @@ def blackout_off_deck(
             )
         deck |= item.mask.data
 
-    if not deck.any():
+    # The union is the only input the blackout needs; `None` (nothing to keep)
+    # is decided there, so the empty case is not checked twice.
+    return blackout_with_union(frame, deck)
+
+
+def blackout_with_union(frame: np.ndarray, union: np.ndarray) -> np.ndarray | None:
+    """Same blackout, from an already-unioned deck mask.
+
+    The split pipeline ships the union mask between processes instead of the
+    instances, so its worker has to apply the *identical* copy; sharing this
+    function is what keeps the two paths comparable.
+    """
+    if union.shape != frame.shape[:2]:
+        raise ValueError(
+            f"union mask shape {union.shape} != frame {frame.shape[:2]}"
+        )
+    if not union.any():
         return None
 
     masked = np.zeros_like(frame)
-    cv2.copyTo(frame, deck.astype(np.uint8), masked)
+    cv2.copyTo(frame, union.astype(np.uint8), masked)
     return masked
