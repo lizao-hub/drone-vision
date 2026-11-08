@@ -8,12 +8,31 @@ from algorithm.config import DEFAULT_SETTINGS, WORKER_ROOT, PipelineSettings
 def test_default_settings_carry_the_bundled_weights_and_config_defaults():
     # The only deployment-dependent values are the three weight paths.
     assert DEFAULT_SETTINGS == PipelineSettings(
-        viaduct_weight=WORKER_ROOT / "models" / "viaduct" / "weights" / "best.pt",
-        vehicle_weight=WORKER_ROOT / "models" / "vehicle" / "weights" / "best.pt",
-        line_weight=WORKER_ROOT / "models" / "line" / "weights" / "best.pt",
+        viaduct_weight=WORKER_ROOT
+        / "models"
+        / "viaduct_seg"
+        / "yolo26m-seg_1080"
+        / "weights"
+        / "best.pt",
+        vehicle_weight=WORKER_ROOT
+        / "models"
+        / "vehicle_detect"
+        / "yolo26m_1080"
+        / "weights"
+        / "best.pt",
+        line_weight=WORKER_ROOT
+        / "models"
+        / "line_detect"
+        / "yolo26m_1080"
+        / "weights"
+        / "best.pt",
     )
-    assert (DEFAULT_SETTINGS.segment_imgsz, DEFAULT_SETTINGS.detect_imgsz) == (960, 640)
-    assert DEFAULT_SETTINGS.line_imgsz == 640
+    # Every model was trained at 1280, so all three resize targets agree.
+    assert (
+        DEFAULT_SETTINGS.segment_imgsz,
+        DEFAULT_SETTINGS.detect_imgsz,
+        DEFAULT_SETTINGS.line_imgsz,
+    ) == (1280, 1280, 1280)
     assert DEFAULT_SETTINGS.viaduct_confidence == 0.25
     assert DEFAULT_SETTINGS.vehicle_confidence == 0.30
     assert DEFAULT_SETTINGS.line_confidence == 0.30

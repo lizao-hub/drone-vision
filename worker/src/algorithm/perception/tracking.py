@@ -1,9 +1,9 @@
 """Object tracking: one ultralytics BYTETracker per enabled label.
 
 ByteTrack associates on IoU/Kalman alone and ignores the class column, so a
-single shared tracker could hand a truck's identity to a neighbouring car.
+single shared tracker could hand one label's identity to a neighbouring label.
 Each label therefore owns its own tracker (and its own id namespace), which
-also keeps ``bus``/``car``/``truck`` identities independent.
+also keeps ``VEHICLE_LABELS`` and ``LINE_LABELS`` identities independent.
 
 The same class tracks lane lines: it is the label set that differs, not the
 algorithm (``labels=LINE_LABELS``).
@@ -80,7 +80,7 @@ class ByteTracker:
             raise ValueError("timestamp_ms must be non-negative")
         if width <= 0 or height <= 0:
             raise ValueError("frame geometry must be positive")
-        # The detector may report bike/person; only configured labels get id.
+        # Only the configured labels get an identity.
         detections = tuple(item for item in detections if item.label in self.labels)
         if (
             self._last_ms is not None

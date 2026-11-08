@@ -1,14 +1,14 @@
 # drone-worker
 
-无人机视角：先分割高架路面，其余涂黑，再把涂黑图送检测，最后用 ByteTrack 追踪 **bus / car / truck**，同时在涂黑图上检测车道线并追踪。
+无人机视角：先分割高架路面，其余涂黑，再把涂黑图送检测，最后用 ByteTrack 追踪 **car**，同时在涂黑图上检测车道线并追踪。
 
 ## 环境
 
-- conda 环境 `pytorch`（torch 2.14.0 + ultralytics 8.4.183 + opencv 5.0.0）
-- 权重：
-  - `models/viaduct/weights/best.pt`：segment，单类 `viaduct`，训练 imgsz 960
-  - `models/vehicle/weights/best.pt`：detect，单类 `car`（按当前权重）；检测端全部输出，追踪端只给 `bus/car/truck` 发 id，其余类别仍留在 `Observation.vehicle`
-  - `models/line/weights/best.pt`：detect，单类 `line`，训练 imgsz 640；车道线段检测
+- conda 环境 `yolo`（torch 2.7.1 + ultralytics 8.4.183 + opencv 4.11.0）
+- 权重（三份都是 1280 训练、1280 推理，即 `PipelineSettings` 的默认值）：
+  - `models/viaduct_seg/yolo26m-seg_1080/weights/best.pt`：YOLO26m segment（27.0M），单类 `viaduct`，imgsz 1280
+  - `models/vehicle_detect/yolo26m_1080/weights/best.pt`：YOLO26m detect（21.8M），单类 `car`，imgsz 1280；检测端不按类别过滤，追踪端只给 `car` 发 id
+  - `models/line_detect/yolo26m_1080/weights/best.pt`：YOLO26m detect（21.8M），单类 `line`，imgsz 1280；车道线段检测
 
 ## 运行
 
@@ -33,7 +33,7 @@ python -m drone_worker --source videos\video1_1080P.mp4
 
 ```text
 frame
-  → 分割(viaduct)                      # retina_masks=True，FP16，直接得到原帧尺寸掩码
+  → 分割(viaduct)                      # retina_masks=True，直接得到原帧尺寸掩码
   → Observation.viaduct: tuple[DetectedObject, ...]   # 每个实例独立 box + mask
   → 贪心掩码 IoU 匹配上一帧              # 实例顺序不稳定，靠这个给 deck 稳定 id
   → Observation.viaduct_tracks: tuple[TrackedObject, ...]   # track_id + box + mask
@@ -41,16 +41,16 @@ frame
   → 涂黑掩码外区域                       # masked[~mask] = 0
   → 检测(模型全部类别，单一 confidence)    # 输入就是涂黑图
   → Observation.vehicle（检测结果原样保留）
-  → 每类一个 ByteTrack（id 形如 car-bt-000001，只给 bus/car/truck 发 id）→ Observation.vehicle_tracks
-  → 车道线检测（同一张涂黑图，模型单类 line，imgsz 640）→ ByteTrack → Observation.line_tracks
+  → 每类一个 ByteTrack（id 形如 car-bt-000001，只给 car 发 id）→ Observation.vehicle_tracks
+  → 车道线检测（同一张涂黑图，模型单类 line，imgsz 1280）→ ByteTrack → Observation.line_tracks
   → Observation
 ```
 
 `DetectedObject` 是唯一的结果类型：`label / confidence / box / mask=None`。分割适配器给每个实例填 `mask`，检测适配器留 `None`。`Observation.viaduct` 是分割实例（每个带自己的 mask，两段高架就是两个对象），`Observation.viaduct_tracks` 是同一批实例配上跨帧稳定 id 的结果（`track_id` 形如 `deck-000001`，`TrackedObject` 也带 `mask`，因为密度要按像素算），`Observation.vehicle` 是检测结果（未赋身份），`Observation.vehicle_tracks` 是配上 track_id 的轨迹，`Observation.line_tracks` 是车道线的轨迹（`track_id` 形如 `line-bt-000001`，`label="line"`）。用于涂黑的并集掩码是派生量，不重复放进 observation。
 
-车道线检测与车辆检测共用同一张涂黑图，原因：实测原图上会捎带检测到桥下/路口的路面标线，涂黑后只剩高架路面的线；`frame_45` 两者都检出 3 条持续存在的线（`line-bt-000001/2/3`），`line_ms` 约 17ms（首帧预热 146ms）。
+车道线检测与车辆检测共用同一张涂黑图，原因：原图上会捎带检测到桥下/路口的路面标线，涂黑后只剩高架路面的线。
 
-高架的实例顺序不稳定（同一块板在两帧里的下标可能互换），[viaduct_tracker.py](worker/src/algorithm/perception/viaduct_tracker.py) 用**掩码 IoU 贪心匹配**上一帧的 deck：≥0.3 就复用 id，未匹配的实例发新 id，消失的 deck 保留 `max_gap_ms=750` 以防单帧漏检换 id。实测 16 帧里两块板的顺序交换了多次，`deck-000001/000002` 始终跟着各自的板。
+高架的实例顺序不稳定（同一块板在两帧里的下标可能互换），[viaduct_tracker.py](worker/src/algorithm/perception/viaduct_tracker.py) 用**掩码 IoU 贪心匹配**上一帧的 deck：≥0.3 就复用 id，未匹配的实例发新 id，消失的 deck 保留 `max_gap_ms=750` 以防单帧漏检换 id。
 
 ## Runtime：车辆地速（MVP）
 
@@ -68,7 +68,7 @@ speed     = |v_car_img - v_ground| * car_width_m / 全图车宽中位数
 - `valid=False` 时 `speeds=()`，**不会给 0**；停着的车会测出真的 0（相对流≈0，而且与尺度无关）。
 - 轨迹丢失 750ms 后从状态里删除；`valid=True` 但 `speeds=()` 表示这一帧没有成熟到可报的车辆，而不是"没有车"。
 
-CLI 每帧打印 `car_speed t=1875ms: 12 cars (min 12.2 max 46.4 km/h)`，每个车框里画 `35km/h`，JSON 里是 `vehicle_speeds`（由 `ViaductUpdate.speed` 直接给出）。实测 120 帧：1388 个车速样本，均值 19.2 km/h（min 0.6 / max 52.6），117/120 帧有输出。
+CLI 每帧打印 `car_speed t=1875ms: 12 cars (min 12.2 max 46.4 km/h)`，每个车框里画 `35km/h`，JSON 里是 `vehicle_speeds`（由 `ViaductUpdate.speed` 直接给出）。
 
 ## Runtime：高架实体（密度 + 平均车速）
 
@@ -130,13 +130,12 @@ CLI 每帧打印 `viaduct t=125ms: deck-000001 15.8% n9 22.4km/h moderate, deck-
 - 分割正常但没检到高架 → 帧有效、`viaduct=()`、跳过检测（全黑图无意义），reason `viaduct_not_detected`（车道线也一起跳过）。
 - 掩码只做本帧多实例并集：不做跨帧保持、不做边界膨胀、不按框中心过滤；检测输入就是并集掩码涂黑后的图。
 - 新轨迹在第二次匹配后才发布（ByteTrack 标准确认策略），首帧只有已确认轨迹。
-- 检测端不按类别过滤：车辆模型所有类别共用 `vehicle_confidence`（默认 0.30），车道线模型用独立的 `line_confidence`（默认 0.30）。
-- 追踪端只给 `bus/car/truck` 发身份，`bike/person` 的框被 tracker 忽略（仍保留在 `Observation.vehicle` 里）；车道线只给 `line` 发身份。
+- 检测端不按类别过滤：车辆模型单类、共用一个 `vehicle_confidence`（默认 0.30），车道线模型用独立的 `line_confidence`（默认 0.30）。
+- 追踪端只给 `car` 发身份（`VEHICLE_LABELS`）；车道线只给 `line` 发身份。
 - 检测只有一个置信度，因此 ByteTrack 的低分关联阶段实际为空。
-- 采样：只有第 0、3、6… 帧会调用一次 `pipeline.process`，因此 Observation 数量、JSONL 行数都等于 `源帧数 / stride`；`timestamp_ms` 仍是源视频时间（间隔约 125ms @24fps），轨迹按这个时间过期。
-- 采样间隔变大后车辆位移也大，ByteTrack 的 IoU/卡尔曼关联会变弱：`stride=5`（208ms）时快速车道的车位移约 30px，相邻采样 IoU 只有 0.1~0.2，低于 ByteTrack 未确认轨迹的 0.3 门限，会一直“新建未确认轨迹→丢弃”，表现为检测到了但没有轨迹；`stride=3`（125ms）可以正常确认。
-- 三处 `predict` 都固定 `rect=True`：按步幅取最小矩形 letterbox（1080p 16:9 下分割是 960×544、检测是 640×384），相比方图少约 40% 的填充像素；框坐标仍归一化到原图，retina 掩码也由 SDK 映射回原帧。
-- 分割模型固定 `quantize=16`（FP16）：它是三模型里最慢的一段，也是唯一能吃满 tensor core 的模型；两个 640 检测模型保持 FP32。Ultralytics 在 `--device cpu` 上会自动回退到 FP32。
+- 采样：只有第 0、3、6… 帧会调用一次 `pipeline.process`，因此 Observation 数量、JSONL 行数都等于 `源帧数 / stride`；`timestamp_ms` 仍是源视频时间，轨迹按这个时间过期。
+- 三处 `predict` 都固定 `rect=True`：按步幅取最小矩形 letterbox（1080p 下三个模型都是 1280×736），相比方图少约 40% 的填充像素；框坐标仍归一化到原图，retina 掩码也由 SDK 映射回原帧。
+- 三个模型都跑 FP32（不传 `quantize`）：1280 下单帧约 19.6 / 12.3 / 11.9ms（分割 / 车辆 / 车道线）。分割关掉 FP16 后只慢约 1ms，所以保留 FP32。
 
 ## 测试
 

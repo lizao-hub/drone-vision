@@ -39,7 +39,7 @@ def build_pipeline(settings: PipelineSettings) -> ObservationPipeline:
         expected_labels=(settings.line_label,),
     )
     tracker = ByteTracker(
-        # Fixed by design: identities are only issued for bus/car/truck.
+        # Fixed by design: identities are only issued for VEHICLE_LABELS.
         labels=VEHICLE_LABELS,
         detection_threshold=settings.vehicle_confidence,
         # Every detection already clears the adapter threshold, so ByteTrack's

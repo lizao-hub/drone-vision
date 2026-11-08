@@ -1,6 +1,7 @@
 # 本地媒体与模型（体积大，不入库）
 assets/
 worker/models/
+worker/models_onnx/
 worker/videos/
 recordings/
 
@@ -37,3 +38,5 @@ worker/AGENTS.md
 # OS
 Thumbs.db
 .DS_Store
+/worker/models_backup/
+/worker/datasets/

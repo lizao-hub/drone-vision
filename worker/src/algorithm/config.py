@@ -9,11 +9,17 @@ from dataclasses import dataclass
 from math import isfinite
 from pathlib import Path
 
-# # .../worker/src/algorithm/config.py -> worker/
+# .../worker/src/algorithm/config.py -> worker/
 WORKER_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_VIADUCT_WEIGHT = WORKER_ROOT / "models" / "viaduct" / "weights" / "best.pt"
-DEFAULT_VEHICLE_WEIGHT = WORKER_ROOT / "models" / "vehicle" / "weights" / "best.pt"
-DEFAULT_LINE_WEIGHT = WORKER_ROOT / "models" / "line" / "weights" / "best.pt"
+DEFAULT_VIADUCT_WEIGHT = (
+    WORKER_ROOT / "models" / "viaduct_seg" / "yolo26m-seg_1080" / "weights" / "best.pt"
+)
+DEFAULT_VEHICLE_WEIGHT = (
+    WORKER_ROOT / "models" / "vehicle_detect" / "yolo26m_1080" / "weights" / "best.pt"
+)
+DEFAULT_LINE_WEIGHT = (
+    WORKER_ROOT / "models" / "line_detect" / "yolo26m_1080" / "weights" / "best.pt"
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -21,11 +27,15 @@ class PipelineSettings:
     viaduct_weight: Path
     vehicle_weight: Path
     line_weight: Path
+    # Where the batch runner writes the annotated mp4 and the JSONL.
     project: Path = WORKER_ROOT / "output"
     device: int | str = 0
-    segment_imgsz: int = 960
-    detect_imgsz: int = 640
-    line_imgsz: int = 640
+    # All three models were trained at 1280; a 1080p 16:9 frame becomes 1280x736
+    # under rect letterboxing.  Keeping inference at the training size keeps the
+    # apparent object scale identical between training and deployment.
+    segment_imgsz: int = 1280
+    detect_imgsz: int = 1280
+    line_imgsz: int = 1280
     viaduct_confidence: float = 0.25
     viaduct_label: str = "viaduct"
     vehicle_confidence: float = 0.30
@@ -70,7 +80,6 @@ class PipelineSettings:
             raise ValueError("line_confidence must be within (0, 1]")
         if not isfinite(self.car_width_m) or self.car_width_m <= 0.0:
             raise ValueError("car_width_m must be finite and positive")
-
 
 
 # The only deployment-dependent part of the settings; every knob keeps the
