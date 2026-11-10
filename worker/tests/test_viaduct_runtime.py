@@ -130,7 +130,7 @@ def _observation(
     )
 
 
-_CONGESTION_KWARGS = ("clear_density", "clear_speed_kmh", "severe_speed_kmh")
+_CONGESTION_KWARGS = ("clear_density", "clear_speed_kmh", "severe_speed_kmh", "dwell_ms")
 
 
 def _runtime(**kwargs) -> ViaductRuntime:
@@ -421,6 +421,25 @@ def test_a_deck_without_a_measurable_speed_is_clear():
     assert left.density > 0.0
     assert left.mean_speed_mps is None
     assert left.congestion is CongestionLevel.CLEAR
+
+
+def test_a_frame_without_a_measurable_speed_keeps_the_previous_label():
+    runtime = _runtime(dwell_ms=500)
+    decks = (_deck(slice(0, 6), "deck-000001"),)
+    slow = (
+        (0.2, 0.5, _dy_for(10.0), "car-bt-000001"),
+        (0.35, 0.5, _dy_for(10.0), "car-bt-000002"),
+    )
+    _step(runtime, 0, decks=decks, cars=slow)  # warm-up: no valid speed yet
+    update = _step(runtime, 1, decks=decks, cars=slow)
+    assert update.decks[0].congestion is CongestionLevel.SEVERE
+
+    # Frame 2: the cars are detected but no longer tracked, so the deck has no
+    # measurable speed; the label must hold instead of falling back to clear.
+    untracked = tuple((x, y, dy, None) for x, y, dy, _ in slow)
+    update = _step(runtime, 2, decks=decks, cars=untracked)
+    assert update.decks[0].mean_speed_mps is None
+    assert update.decks[0].congestion is CongestionLevel.SEVERE
 
 
 def test_congestion_thresholds_are_configurable():

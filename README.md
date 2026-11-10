@@ -98,4 +98,4 @@ $env:PYTHONPATH="$PWD\src"
 python -m pytest tests -q
 ```
 
-108 个测试，纯 CPU，不需要权重和视频。依赖以 `worker/requirements.txt` 为准（`ultralytics==8.4.183`；旧版 ultralytics 的 track id 是全局计数，会让 `test_each_label_owns_its_identity_namespace` 失败）。
+122 个测试，纯 CPU，不需要权重和视频。依赖以 `worker/requirements.txt` 为准（`ultralytics==8.4.183`；旧版 ultralytics 的 track id 是全局计数，会让 `test_each_label_owns_its_identity_namespace` 失败）。

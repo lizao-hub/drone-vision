@@ -10,15 +10,18 @@ composition point for the two per-deck measurements::
 The pair is reduced to a rough congestion label (:class:`CongestionLevel`), a
 dashboard heuristic rather than a traffic-flow model::
 
-    congestion(deck) = clear    when there is no measurable speed, the deck is
-                                too empty to be a jam, or the traffic flows
+    congestion(deck) = clear    when the deck is too empty to be a jam, or the
+                                traffic flows (and, on a cold start, when no
+                                measurable speed exists yet)
                        severe   when the deck is crowded and the speed has
                                 collapsed
                        moderate otherwise
 
 Deck identity comes from ``Observation.viaduct_tracks``: :class:`ViaductTracker`
-already matched the instances across frames, so this runtime matches nothing and
-keeps no deck state of its own.  Vehicle speeds come from an injected
+already matched the instances across frames, so this runtime matches nothing.
+The one piece of state is the per-deck label, kept by an injected
+:class:`CongestionStabilizer` (dwell filter + missing-speed hold).  Vehicle
+speeds come from an injected
 :class:`VehicleSpeedRuntime`, and that state machine is called **exactly once**
 per observation -- calling it twice with the same timestamp restarts its tracks,
 because it treats a non-advancing timestamp as a new appearance.
@@ -33,9 +36,14 @@ Policies:
       this frame -- no car at all, or only tracks too young for a speed; a
       stopped car is a measured ``0.0`` and never ``None``;
     * ``congestion`` is a heuristic on the two measurements above, not another
-      measurement: a deck without a measurable speed is reported ``clear``
-      (inventing a level from density alone would be worse), and a deck below
-      ``clear_density`` is never congested, because one slow car is not a jam;
+      measurement: a deck below ``clear_density`` is never congested, because
+      one slow car is not a jam, and a deck with no measurable speed is
+      ``clear`` on a cold start (inventing a level from density alone would be
+      worse) but keeps its previous label for up to ``max_hold_ms`` afterwards;
+    * the reported label is dwell-filtered: a different raw label must persist
+      for ``dwell_ms`` of observation time before it is reported, so a value
+      hovering at a threshold no longer flickers frame by frame; the unfiltered
+      label is still available from :meth:`CongestionStabilizer.classify`;
     * density counts every detected box (``Observation.vehicle``) while the mean
       speed only sees tracks that matured inside :class:`VehicleSpeedRuntime`,
       so ``vehicles`` can be larger than the number of cars behind the mean;
@@ -50,22 +58,14 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-from enum import StrEnum
 from math import isfinite
 
 import numpy as np
 
+from algorithm.domain.congestion import CongestionLevel, CongestionStabilizer
 from algorithm.domain.geometry import Box
 from algorithm.domain.observations import DetectedObject, Observation, TrackedObject
 from algorithm.domain.vehicle_speed_runtime import VehicleSpeedRuntime, VehicleSpeedUpdate
-
-
-class CongestionLevel(StrEnum):
-    """Rough congestion label for one deck; ``str`` value is the JSON payload."""
-
-    CLEAR = "clear"
-    MODERATE = "moderate"
-    SEVERE = "severe"
 
 
 @dataclass(frozen=True, slots=True)
@@ -150,21 +150,17 @@ class ViaductRuntime:
         clear_density: float = 0.08,
         clear_speed_kmh: float = 30.0,
         severe_speed_kmh: float = 12.0,
+        dwell_ms: int = 700,
     ) -> None:
         if not isinstance(speed, VehicleSpeedRuntime):
             raise TypeError("speed must be a VehicleSpeedRuntime")
-        if not isfinite(clear_density) or not 0.0 <= clear_density <= 1.0:
-            raise ValueError("clear_density must be finite and within [0, 1]")
-        if not isfinite(clear_speed_kmh) or clear_speed_kmh <= 0.0:
-            raise ValueError("clear_speed_kmh must be finite and positive")
-        if not isfinite(severe_speed_kmh) or severe_speed_kmh <= 0.0:
-            raise ValueError("severe_speed_kmh must be finite and positive")
-        if severe_speed_kmh >= clear_speed_kmh:
-            raise ValueError("severe_speed_kmh must be below clear_speed_kmh")
         self._speed = speed
-        self.clear_density = clear_density
-        self.clear_speed_kmh = clear_speed_kmh
-        self.severe_speed_kmh = severe_speed_kmh
+        self._congestion = CongestionStabilizer(
+            clear_density=clear_density,
+            clear_speed_kmh=clear_speed_kmh,
+            severe_speed_kmh=severe_speed_kmh,
+            dwell_ms=dwell_ms,
+        )
 
     def update(self, observation: Observation) -> ViaductUpdate:
         timestamp_ms = observation.timestamp_ms
@@ -202,6 +198,7 @@ class ViaductRuntime:
             decks=tuple(
                 self._deck_stats(
                     deck.track_id,
+                    timestamp_ms,
                     deck.mask.data,
                     observation.vehicle,
                     speeds.get(deck.track_id, ()),
@@ -214,6 +211,7 @@ class ViaductRuntime:
     def _deck_stats(
         self,
         deck_id: str,
+        timestamp_ms: int,
         mask: np.ndarray,
         vehicles: Sequence[DetectedObject],
         speeds: Sequence[float],
@@ -226,23 +224,10 @@ class ViaductRuntime:
             density=density,
             mean_speed_mps=mean_speed_mps,
             vehicles=owned,
-            congestion=self._congestion(density, mean_speed_mps),
+            congestion=self._congestion.update(
+                deck_id, timestamp_ms, density, mean_speed_mps
+            ),
         )
-
-    def _congestion(
-        self, density: float, mean_speed_mps: float | None
-    ) -> CongestionLevel:
-        """Rough label: crowd first, then speed; no measurable speed is clear."""
-        if mean_speed_mps is None:
-            return CongestionLevel.CLEAR
-        if density < self.clear_density:
-            return CongestionLevel.CLEAR
-        speed_kmh = mean_speed_mps * 3.6
-        if speed_kmh >= self.clear_speed_kmh:
-            return CongestionLevel.CLEAR
-        if speed_kmh <= self.severe_speed_kmh:
-            return CongestionLevel.SEVERE
-        return CongestionLevel.MODERATE
 
 
 # -- helpers ---------------------------------------------------------------

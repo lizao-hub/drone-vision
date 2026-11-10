@@ -104,9 +104,10 @@ congestion(deck) = 密度先做闸门、再看车速的启发式标签
 - 速度侧不可用（定不出尺度 / 没有地面流）→ **整帧 `valid=False`**，reason 透传 `scale_unavailable` / `flow_unavailable`，不产出 deck；没有 deck → `viaduct_unavailable`。
 - `valid=True` 但某块板 `mean_speed_mps=None`：这块板这一帧没有可测的车（没车，或轨迹还没成熟）；停着的车是测出来的 `0.0`，不是缺失。
 - 冻结策略沿用 `VehicleSpeedRuntime`：`frame_valid=False` 或 `unknown_reasons` 非空的帧不产出 deck。
-- 拥挤判定是**启发式**，不是交通流模型：三个阈值是 `ViaductRuntime(clear_density=0.08, clear_speed_kmh=30.0, severe_speed_kmh=12.0)` 的构造参数；没有可测车速时直接判 `clear`（不拿密度硬凑一个等级）。
-- 密度是像素覆盖率，会随无人机高度变化：固定航高下够用，跨高度要换成"车辆数/面积"（`VehicleSpeedRuntime` 的 `scale_px` 能给出米/像素）。
-- 逐帧判定会在阈值附近抖动，目前没有做迟滞；`valid=True` 时 `congestion` 一定有值（`clear` / `moderate` / `severe`）。
+- 拥挤判定是**启发式**，不是交通流模型：阈值是 `ViaductRuntime(clear_density=0.08, clear_speed_kmh=30.0, severe_speed_kmh=12.0, dwell_ms=700)` 的构造参数；冷启动时没有可测车速直接判 `clear`（不拿密度硬凑一个等级）。
+- 标签由 `algorithm.domain.congestion.CongestionStabilizer` 稳住：某帧没有可测车速时**保持上一标签**，连续 3 s 没有可测车速才回落到 `clear`；另一个标签要连续持续 `dwell_ms=700` 才切换，所以阈值附近不再逐帧闪烁。**尚未做阈值回差**（8% 进 / 6% 出、30→33、12→14），那是下一步。状态按 `deck_id` 存，超过 3 s 没再出现就丢弃；`valid=True` 时 `congestion` 一定有值（`clear` / `moderate` / `severe`）。
+- 密度是**同一帧内的面积比**，不是像素覆盖率随高度变化：正下视纯变焦时分子（车辆框并集 ∩ 桥面）和分母（桥面掩码）同比例缩放，读数**近似与航高无关**，固定航高下可直接用。真正会改变读数的是：车变小后的检测召回（框变紧或漏检）、桥面掩码质量、斜视时的透视面积权重，以及画面里露出的桥面范围。跨航高/跨相机不要直接比，业务口径应换成"辆/km"或占有率（`scale_px` 能给出米/像素，可换算桥面长度）。另外分子是检测框覆盖而不是车辆像素，框越松密度越高。
+- 逐帧原始判定会在阈值附近抖动，所以标签是驻留过滤后的结果（见上一条）；原始判定仍可由 `CongestionStabilizer.classify()` 取到，用于排查。
 
 CLI 每帧打印 `viaduct t=125ms: deck-000001 15.8% n9 22.4km/h moderate, deck-000002 12.7% n4 clear`；视频左下角每块板一行，颜色与板上轮廓、`#N` 标签一致：`#1 15.8% n9 22km/h moderate`、`#2 12.7% n4 -- km/h clear`；没有 deck 统计的帧（速度不可用）左下角留空。JSON 里是 `viaduct_stats[*].decks[*]`（含 `congestion`）。`ViaductUpdate.speed` 里仍带每辆车的 `speed_mps / speed_kmh`，渲染和 JSON 的 `vehicle_speeds` 直接用它。
 
