@@ -1,15 +1,16 @@
-"""Offline batch: a video file in, an annotated mp4 and a JSONL out.
+"""Offline batch: a video file in, a per-frame JSONL out (mp4 optional).
 
-This is the only entry point: it reads the file sequentially at its own pace,
-runs the shared pipeline, and exits at the end of the file.  Every tuning knob
-comes from ``PipelineSettings``; the flags here only choose the input, where the
-two outputs go, and whether each of them is written.
+Every tuning knob comes from ``PipelineSettings``; the flags here only choose the
+input, the device, the sampling stride and whether the annotated video is written
+as well.  The mp4 is **off by default** -- it is an eyeball/demo artifact, while
+the JSONL is what the regression and the platform consume.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import sys
 import time
 from pathlib import Path
 from typing import Sequence
@@ -23,6 +24,13 @@ from algorithm.runtime.factory import build_pipeline
 from algorithm.runtime.snapshots import record
 from algorithm.runtime.sources import FileSequenceSource
 from algorithm.runtime.telemetry import FrameTelemetry
+from drone_worker.args import (
+    add_device,
+    add_model_overrides,
+    add_sampling,
+    add_source,
+    settings_from_args,
+)
 from drone_worker.render import annotate
 
 
@@ -31,36 +39,28 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         prog="python -m drone_worker",
         description="Segment the viaduct deck, black out the rest, track vehicles on it.",
     )
-    parser.add_argument("--source", type=Path, required=True, help="source video file")
-    parser.add_argument(
-        "--stride",
-        type=int,
-        default=3,
-        help="run inference on every Nth frame; one Observation/JSON line per sampled frame (default: 3)",
-    )
-    parser.add_argument("--log-every", type=int, default=50)
+    add_source(parser, help_text="source video file")
+    add_device(parser, pair=False)
+    add_sampling(parser)
+    add_model_overrides(parser)
     parser.add_argument(
         "--save-video",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="write the annotated mp4 (default: on)",
-    )
-    parser.add_argument(
-        "--save-json",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="write the per-frame JSONL (default: on)",
+        action="store_true",
+        help="also write the annotated mp4 (default: off; the JSONL is always written)",
     )
     args = parser.parse_args(argv)
+    if len(args.device) != 1:
+        parser.error("batch drives one device; use `pipeline` for two cards")
     return args
 
 
 def main_batch(argv: Sequence[str] | None = None) -> int:
     args = _parse_args(argv)
-    settings = DEFAULT_SETTINGS
-    input_path = args.source.resolve()
+    settings = settings_from_args(DEFAULT_SETTINGS, args)
+    input_path = Path(args.source).resolve()
     if not input_path.is_file():
-        raise FileNotFoundError(f"source does not exist: {input_path}")
+        print(f"error: source does not exist: {input_path}", file=sys.stderr)
+        return 2
     # Both outputs go to the configured project directory; there is no flag for
     # it, because changing it is a settings change, not a per-run choice.
     project = settings.project
@@ -68,11 +68,7 @@ def main_batch(argv: Sequence[str] | None = None) -> int:
     annotated_path = project / f"{input_path.stem}_pipeline.mp4"
     json_path = project / f"{input_path.stem}.jsonl"
 
-    source = FileSequenceSource(
-        [input_path],
-        frame_stride=args.stride,
-        realtime=False,
-    )
+    source = FileSequenceSource(input_path, frame_stride=args.stride)
     source.open()
     pipeline = build_pipeline(settings)
     viaduct_runtime = ViaductRuntime(
@@ -98,7 +94,7 @@ def main_batch(argv: Sequence[str] | None = None) -> int:
         total_frames=source.frame_count or None,
         stride=args.stride,
     )
-    json_stream = json_path.open("w", encoding="utf-8") if args.save_json else None
+    json_stream = json_path.open("w", encoding="utf-8")
     started_at = time.perf_counter()
 
     try:
@@ -123,25 +119,21 @@ def main_batch(argv: Sequence[str] | None = None) -> int:
                         viaduct=viaduct,
                     )
                 )
-            if json_stream is not None:
-                json_stream.write(
-                    json.dumps(
-                        record(observation, viaduct),
-                        ensure_ascii=False,
-                    )
-                    + "\n"
+            json_stream.write(
+                json.dumps(
+                    record(observation, viaduct),
+                    ensure_ascii=False,
                 )
+                + "\n"
+            )
     finally:
         source.close()
         if writer is not None:
             writer.release()
-        if json_stream is not None:
-            json_stream.close()
+        json_stream.close()
 
     telemetry.summary(elapsed_s=time.perf_counter() - started_at)
     if writer is not None:
         print(f"video: {annotated_path}")
-    if json_stream is not None:
-        print(f"jsonl: {json_path}")
+    print(f"jsonl: {json_path}")
     return 0
-

@@ -17,6 +17,41 @@ import numpy as np
 DEFAULT_BITRATE = "4M"
 DEFAULT_FFMPEG = "ffmpeg"
 
+X264_ENCODER = "libx264"
+NVENC_ENCODER = "h264_nvenc"
+
+# Probing costs one short ffmpeg run, so it is cached per binary.
+_ENCODER_CACHE: dict[str, bool] = {}
+
+
+def encoder_available(binary: str, name: str = NVENC_ENCODER) -> bool:
+    """Whether ``binary`` can really encode with ``name`` (cached per binary).
+
+    The check runs a one-frame encode instead of grepping ``-encoders``: a build
+    can list ``h264_nvenc`` and still fail at runtime when the driver or the GPU
+    is missing, and a failed sink means a restart loop in the relay.
+    """
+    key = f"{binary}:{name}"
+    cached = _ENCODER_CACHE.get(key)
+    if cached is not None:
+        return cached
+    ok = False
+    try:
+        proc = subprocess.run(
+            [
+                binary, "-hide_banner", "-loglevel", "error",
+                "-f", "lavfi", "-i", "color=c=black:s=256x256:d=0.1",
+                "-c:v", name, "-f", "null", "-",
+            ],
+            capture_output=True,
+            timeout=15,
+        )
+        ok = proc.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        ok = False
+    _ENCODER_CACHE[key] = ok
+    return ok
+
 
 def ffmpeg_binary(explicit: str | None = None) -> str:
     """``--ffmpeg`` > ``$FFMPEG_BIN`` > ``PATH`` > the imageio-ffmpeg wheel."""
@@ -39,8 +74,14 @@ def build_ffmpeg_args(
     fps: float,
     url: str,
     bitrate: str = DEFAULT_BITRATE,
+    encoder: str = X264_ENCODER,
 ) -> list[str]:
-    """ffmpeg arguments (without the binary) for raw BGR stdin -> FLV/RTMP."""
+    """ffmpeg arguments (without the binary) for raw BGR stdin -> FLV/RTMP.
+
+    ``h264_nvenc`` keeps the x264-equivalent latency profile (no B-frames, the
+    same GOP) but moves the encode off the CPU, which is where the relay's frame
+    budget was going.
+    """
     if width <= 0 or height <= 0:
         raise ValueError("frame size must be positive")
     if not fps > 0.0:
@@ -48,6 +89,26 @@ def build_ffmpeg_args(
     if not url:
         raise ValueError("destination url must be non-empty")
     gop = max(1, int(round(fps)))
+    if encoder == NVENC_ENCODER:
+        codec = [
+            "-c:v", "h264_nvenc",
+            "-preset", "p1",
+            "-tune", "ll",
+            "-profile:v", "baseline",
+            "-bf", "0",
+            "-g", str(gop),
+        ]
+    elif encoder == X264_ENCODER:
+        codec = [
+            "-c:v", "libx264",
+            "-preset", "veryfast",
+            "-tune", "zerolatency",
+            "-profile:v", "baseline",
+            "-bf", "0",
+            "-g", str(gop),
+        ]
+    else:
+        raise ValueError(f"unsupported encoder: {encoder}")
     return [
         "-hide_banner",
         "-loglevel",
@@ -65,16 +126,7 @@ def build_ffmpeg_args(
         "-i",
         "-",
         "-an",
-        "-c:v",
-        "libx264",
-        "-preset",
-        "veryfast",
-        "-tune",
-        "zerolatency",
-        "-profile:v",
-        "baseline",
-        "-bf",
-        "0",
+        *codec,
         "-pix_fmt",
         "yuv420p",
         "-b:v",
@@ -83,8 +135,6 @@ def build_ffmpeg_args(
         bitrate,
         "-bufsize",
         bitrate,
-        "-g",
-        str(gop),
         "-f",
         "flv",
         "-rw_timeout",
@@ -105,6 +155,7 @@ class FfmpegSink:
         fps: float,
         bitrate: str = DEFAULT_BITRATE,
         ffmpeg: str | None = None,
+        encoder: str | None = None,
     ) -> None:
         if not isinstance(url, str) or not url:
             raise ValueError("url must be a non-empty string")
@@ -118,6 +169,11 @@ class FfmpegSink:
         self.fps = fps
         self.bitrate = bitrate
         self._binary = ffmpeg_binary(ffmpeg)
+        # ``None`` means "use NVENC when this binary can run it".  The probe is
+        # cached, so rebuilding the sink after a reconnect costs nothing.
+        self.encoder = encoder or (
+            NVENC_ENCODER if encoder_available(self._binary) else X264_ENCODER
+        )
         self._proc: subprocess.Popen[bytes] | None = None
 
     def start(self) -> "FfmpegSink":
@@ -130,6 +186,7 @@ class FfmpegSink:
                 fps=self.fps,
                 url=self.url,
                 bitrate=self.bitrate,
+                encoder=self.encoder,
             )],
             stdin=subprocess.PIPE,
             stdout=subprocess.DEVNULL,

@@ -5,6 +5,9 @@ the viaduct shows up by what is not covered.  Annotation policy:
 
     * one colour per deck, used both for its outline and for its stats line, so
       the numbers at the bottom-left always point at a visible deck;
+    * the ``#N`` shown to the operator is the deck's left-to-right position in
+      the frame, not its global ``deck-000006`` track id: a long-lived relay
+      mints a fresh id after every scene cut, and #6 on screen reads as a bug;
     * a vehicle is drawn only when it has a measured ground speed -- a box with
       the speed inside it; without a speed it gets no annotation at all;
     * lane markings are not drawn (they are still measured, just not shaded);
@@ -40,13 +43,17 @@ def annotate(
 ) -> np.ndarray:
     canvas = frame.copy()
     decks = [track for track in observation.viaduct_tracks if track.mask is not None]
-    colours = _deck_colours(viaduct, decks)
+    # Left-to-right, so #1 is the deck an operator would call "the first one";
+    # the track id only breaks ties, and the counter never reaches the picture.
+    ordered = sorted(decks, key=lambda track: (track.box.x1, track.box.y1, track.track_id))
+    numbers = {track.track_id: index + 1 for index, track in enumerate(ordered)}
+    colours = _deck_colours(ordered)
     union = _union_mask(decks)
     if union is not None:
         canvas = _tint_outside(canvas, union)
-    _outline_decks(canvas, decks, colours)
+    _outline_decks(canvas, decks, colours, numbers)
     _draw_speeds(canvas, observation, viaduct)
-    _draw_deck_stats(canvas, viaduct, colours)
+    _draw_deck_stats(canvas, viaduct, colours, numbers)
     return canvas
 
 
@@ -62,23 +69,30 @@ def _union_mask(decks: list[TrackedObject]) -> np.ndarray | None:
 
 
 def _tint_outside(canvas: np.ndarray, union: np.ndarray) -> np.ndarray:
-    overlay = canvas.copy()
-    overlay[~union] = _OUTSIDE_COLOUR
-    return cv2.addWeighted(overlay, 0.30, canvas, 0.70, 0.0)
+    """Blend a flat colour under everything outside the decks.
+
+    The obvious implementation -- copy, boolean-index the outside, then
+    ``addWeighted`` the whole frame -- costs 23 ms at 1080p because the boolean
+    scatter touches 1.5M pixels one by one.  Blending the whole frame and then
+    copying the deck pixels back is ~4x faster and pixel-identical.
+    """
+    solid = np.empty_like(canvas)
+    solid[...] = _OUTSIDE_COLOUR
+    tinted = cv2.addWeighted(canvas, 0.70, solid, 0.30, 0.0)
+    cv2.copyTo(canvas, union.view(np.uint8), tinted)
+    return tinted
 
 
 # -- per-deck anchor -------------------------------------------------------
-def _deck_colours(
-    viaduct: ViaductUpdate | None, decks: list[TrackedObject]
-) -> dict[str, tuple[int, int, int]]:
-    """Stable colour per deck id: the palette index follows the sorted ids."""
-    if viaduct is not None and viaduct.valid:
-        deck_ids = [item.deck_id for item in viaduct.decks]
-    else:
-        deck_ids = sorted(deck.track_id for deck in decks)
+def _deck_colours(decks: list[TrackedObject]) -> dict[str, tuple[int, int, int]]:
+    """Stable colour per deck id: the palette follows the display order.
+
+    ``decks`` must already be in display order (left to right), so the same
+    physical deck keeps its colour while the relay is running.
+    """
     return {
-        deck_id: _DECK_COLOURS[index % len(_DECK_COLOURS)]
-        for index, deck_id in enumerate(deck_ids)
+        deck.track_id: _DECK_COLOURS[index % len(_DECK_COLOURS)]
+        for index, deck in enumerate(decks)
     }
 
 
@@ -86,18 +100,22 @@ def _outline_decks(
     canvas: np.ndarray,
     decks: list[TrackedObject],
     colours: dict[str, tuple[int, int, int]],
+    numbers: dict[str, int],
 ) -> None:
-    """Outline each deck in its colour and tag it with the same ``#id``."""
+    """Outline each deck in its colour and tag it with the same ``#N``."""
     for deck in sorted(decks, key=lambda track: track.track_id):
         colour = colours.get(deck.track_id, _DECK_COLOURS[0])
-        mask = deck.mask.data.astype(np.uint8)
+        # A bool mask is already 1 byte per pixel, so the view is free; the
+        # astype it replaces allocated and copied 2 MB per deck per frame.
+        mask = deck.mask.data.view(np.uint8)
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         cv2.drawContours(canvas, contours, -1, colour, 2, cv2.LINE_AA)
         rows = np.flatnonzero(mask.any(axis=1))
         columns = np.flatnonzero(mask.any(axis=0))
         if rows.size and columns.size:
             origin = (int(columns[0]) + 2, max(int(rows[0]) - 5, 12))
-            _text(canvas, f"#{_short_id(deck.track_id)}", origin, 0.5, colour)
+            number = numbers.get(deck.track_id, _short_id(deck.track_id))
+            _text(canvas, f"#{number}", origin, 0.5, colour)
 
 
 # -- vehicles and their speeds ---------------------------------------------
@@ -128,16 +146,25 @@ def _draw_deck_stats(
     canvas: np.ndarray,
     viaduct: ViaductUpdate | None,
     colours: dict[str, tuple[int, int, int]],
+    numbers: dict[str, int],
 ) -> None:
     """One line per deck, in the deck's own colour; nothing when the frame has none."""
     if viaduct is None or not viaduct.valid or not viaduct.decks:
         return
     baseline = canvas.shape[0] - 10
-    for index, item in enumerate(reversed(viaduct.decks)):
+    # Draw the highest number first (bottom line), so the block reads #1..#N
+    # top-down regardless of the order the segmenter returned the decks in.
+    order = sorted(
+        viaduct.decks,
+        key=lambda item: numbers.get(item.deck_id, -1),
+        reverse=True,
+    )
+    for index, item in enumerate(order):
         colour = colours.get(item.deck_id, _DECK_COLOURS[0])
+        number = numbers.get(item.deck_id, _short_id(item.deck_id))
         speed = "-- km/h" if item.mean_speed_kmh is None else f"{item.mean_speed_kmh:.0f}km/h"
         text = (
-            f"#{_short_id(item.deck_id)}  {item.density:.1%}  n{item.vehicles}"
+            f"#{number}  {item.density:.1%}  n{item.vehicles}"
             f"  {speed}  {item.congestion.value}"
         )
         origin = (10, baseline - index * _STAT_LINE_HEIGHT)

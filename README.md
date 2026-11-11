@@ -50,10 +50,10 @@ Windows 侧用 ffmpeg 模拟无人机/机巢推流（默认推 `assets/drone.mp4
 ```powershell
 cd worker
 $env:PYTHONPATH="$PWD\src"
-# 离线 batch：视频进，标注 mp4 / JSONL 出
+# 离线 batch：视频进，JSONL 出（--save-video 才附带标注 mp4）
 python -m drone_worker --source videos\video1_1080P.mp4
 # 两卡流水线：分割在卡0、检测在卡1，多进程 + 共享内存（离线吞吐优化）
-python -m drone_worker pipeline --source videos\video1_1080P.mp4 --devices 0,1
+python -m drone_worker pipeline --source videos\video1_1080P.mp4 --device 0,1
 # 实时 relay：RTSP 拉流推理、RTMP 回推（串行链路）
 python -m drone_worker relay --source rtsp://127.0.0.1:8554/drone1 --dest rtmp://127.0.0.1:1935/drone1_yolo --device 0
 ```

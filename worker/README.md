@@ -22,24 +22,26 @@ python -m drone_worker --source videos\video1_1080P.mp4
 
 输出：
 
-- `output/<视频名>_pipeline.mp4`：高架区域不涂色、其余区域蓝色半透明 + 只给有速度的车画框并在框内写速度 + 左下角每块板一行 `#1 15.8% n9 22km/h moderate`（颜色与板上轮廓、`#N` 标签一致）
-- `output/<视频名>.jsonl`：每帧一条 Observation
+- `output/<视频名>.jsonl`：每帧一条 Observation（默认唯一产物）
+- `output/<视频名>_pipeline.mp4`：需要 `--save-video` 才写；高架区域不涂色、其余区域蓝色半透明 + 只给有速度的车画框并在框内写速度 + 左下角每块板一行 `#1 15.8% n9 22km/h moderate`（颜色与板上轮廓、`#N` 标签一致）
 
-两个输出默认都写，`--save-video` / `--save-json` 用 `--no-save-video`、`--no-save-json` 关掉（`argparse.BooleanOptionalAction`，默认 `True`）。
+JSONL 总是写，mp4 默认关（它只用于肉眼检查/演示，回归和平台只吃 JSONL）。
 
-常用参数：`--source`（**必填**）、`--stride`（默认 **3**，即每 3 帧推理一次、每 3 帧产出一个 Observation / 一行 JSON）、`--log-every`（进度行间隔，默认 50）、`--save-video` / `--save-json`。输出目录固定取 `PipelineSettings.project`（默认 `worker/output/`），CLI 不提供覆盖；阈值、imgsz、类别、`car_width_m`、`device`、`max_lost_ms` 同样全部走 `PipelineSettings`。源视频的 `fps` 只用于输出 mp4 的帧率和播放配速，不参与追踪参数（轨迹按毫秒过期）。
+常用参数：`--source`（**必填**）、`--device`（默认 `0`，或 `cpu`/`0,1`）、`--stride`（默认 **3**，即每 3 帧推理一次、每 3 帧产出一个 Observation / 一行 JSON）、`--log-every`（进度行间隔，默认 50）、`--save-video`。输出目录固定取 `PipelineSettings.project`（默认 `worker/output/`），CLI 不提供覆盖；阈值、imgsz、类别、`car_width_m`、`device`、`max_lost_ms` 同样全部走 `PipelineSettings`。源视频的 `fps` 只用于输出 mp4 的帧率和播放配速，不参与追踪参数（轨迹按毫秒过期）。
 
-另有两个子命令：
+另有两个子命令，三个入口共用同一套参数（`--source` / `--device` / `--stride` / `--log-every` / 三个 imgsz + 三个 confidence）：
 
 ```powershell
 # 两卡流水线：卡0 分割、卡1 双检测，多进程 + 共享内存环形缓冲（离线吞吐优化；
-# 不支持 --save-video；--devices 只接受 2 个索引：分割卡、检测卡）
-python -m drone_worker pipeline --source videos\video1_1080P.mp4 --devices 0,1
+# 只写 JSONL，不接受 --save-video；--device 给两个索引是分卡，给一个是两段同卡）
+python -m drone_worker pipeline --source videos\video1_1080P.mp4 --device 0,1
 # 实时 relay：RTSP（或本地视频，按自身帧率循环回放）拉流 → 串行 pipeline 推理 → ffmpeg 推 RTMP
 python -m drone_worker relay --source rtsp://127.0.0.1:8554/drone1 --dest rtmp://127.0.0.1:1935/drone1_yolo --device 0
 ```
 
-relay 走**串行**链路，输出按 `--out-fps`（默认 10）配速；读线程只保留最新一帧，跟不上时丢帧保实时（`dropped` 计数），源断线/结束自动重连，ffmpeg sink 断开自动重启。CLI 没给的模型参数全部回落到 `PipelineSettings`；`--track-timeout-ms` 默认 3000（比 batch 的 1000 宽松，抗丢帧造成的轨迹间隙）。
+relay 走**串行**推理链路，三个线程分工：读线程解码并只保留最新一帧（`dropped` 计数），主循环按 `--stride`（默认 1，按**源帧号**抽样）推理，渲染线程做 `annotate` + 推 RTMP（跟不上时丢已推理结果，`render_dropped` 计数）。
+
+**输出帧率不单独配置**：`out_fps = 源fps / stride`，编码器时间戳和发送配速都用这个推导值，所以 `--stride 3` 在 30fps 源上就是 10fps 输出，不可能出现"参数配错导致视频变速"。日志同时打标称与实际帧率，偏差超过 10% 会告警一次（说明 stride 相对当前算力太小）。源断线/结束自动重连，ffmpeg sink 断开自动重启。CLI 没给的模型参数全部回落到 `PipelineSettings`；`--track-timeout-ms` 默认 3000（比 batch 的 1000 宽松，抗丢帧造成的轨迹间隙）。
 
 ## 单帧数据流
 
@@ -109,7 +111,7 @@ congestion(deck) = 密度先做闸门、再看车速的启发式标签
 - 密度是**同一帧内的面积比**，不是像素覆盖率随高度变化：正下视纯变焦时分子（车辆框并集 ∩ 桥面）和分母（桥面掩码）同比例缩放，读数**近似与航高无关**，固定航高下可直接用。真正会改变读数的是：车变小后的检测召回（框变紧或漏检）、桥面掩码质量、斜视时的透视面积权重，以及画面里露出的桥面范围。跨航高/跨相机不要直接比，业务口径应换成"辆/km"或占有率（`scale_px` 能给出米/像素，可换算桥面长度）。另外分子是检测框覆盖而不是车辆像素，框越松密度越高。
 - 逐帧原始判定会在阈值附近抖动，所以标签是驻留过滤后的结果（见上一条）；原始判定仍可由 `CongestionStabilizer.classify()` 取到，用于排查。
 
-CLI 每帧打印 `viaduct t=125ms: deck-000001 15.8% n9 22.4km/h moderate, deck-000002 12.7% n4 clear`；视频左下角每块板一行，颜色与板上轮廓、`#N` 标签一致：`#1 15.8% n9 22km/h moderate`、`#2 12.7% n4 -- km/h clear`；没有 deck 统计的帧（速度不可用）左下角留空。JSON 里是 `viaduct_stats[*].decks[*]`（含 `congestion`）。`ViaductUpdate.speed` 里仍带每辆车的 `speed_mps / speed_kmh`，渲染和 JSON 的 `vehicle_speeds` 直接用它。
+CLI 每帧打印 `viaduct t=125ms: deck-000001 15.8% n9 22.4km/h moderate, deck-000002 12.7% n4 clear`；视频左下角每块板一行，颜色与板上轮廓、`#N` 标签一致：`#1 15.8% n9 22km/h moderate`、`#2 12.7% n4 -- km/h clear`；没有 deck 统计的帧（速度不可用）左下角留空。`#N` 是**画面里从左到右的序号**，与内部 track id 无关：relay 长时间运行、镜头切换或视频循环后会拿到新的 `deck-000006`，但画面编号始终从 `#1` 重新排。JSON 里是 `viaduct_stats[*].decks[*]`（含 `congestion`）。`ViaductUpdate.speed` 里仍带每辆车的 `speed_mps / speed_kmh`，渲染和 JSON 的 `vehicle_speeds` 直接用它。
 
 ## 目录
 
@@ -141,10 +143,10 @@ CLI 每帧打印 `viaduct t=125ms: deck-000001 15.8% n9 22.4km/h moderate, deck-
 | `src/algorithm/runtime/live.py` | 实时帧源：读线程 + 丢旧保新单槽队列，RTSP 断线/文件结束自动重开 |
 | `src/algorithm/runtime/rtmp_sink.py` | ffmpeg RTMP sink：raw BGR 帧进 stdin、FLV 出，进程挂了由调用方重启 |
 | `src/drone_worker/render.py` | 可视化：高架外蓝色半透明、有速度的车框 + 速度、左下角每板一行统计（同色轮廓 + `#N` 锚点） |
-| `src/drone_worker/batch.py` | `python -m drone_worker [batch]`：视频文件进、标注 mp4 / JSONL 出（离线入口） |
-| `src/drone_worker/parallel.py` | `python -m drone_worker pipeline`：两卡流水线入口（分割/检测分卡，多进程 + 共享内存） |
+| `src/drone_worker/batch.py` | `python -m drone_worker [batch]`：视频文件进、JSONL 出（`--save-video` 附带标注 mp4，默认关） |
+| `src/drone_worker/pipeline.py` | `python -m drone_worker pipeline`：两卡流水线入口（分割/检测分卡，多进程 + 共享内存） |
 | `src/drone_worker/relay.py` | `python -m drone_worker relay`：实时链路入口（RTSP 拉流 → 推理 → RTMP 回推） |
-| `src/drone_worker/args.py` | CLI 共享小工具（`--device` 解析） |
+| `src/drone_worker/args.py` | 三个入口共享的 CLI 参数（`--source`/`--device`/`--stride`/`--log-every`/模型覆盖） |
 | `src/drone_worker/__main__.py` | `python -m` 入口：路由 `batch` / `pipeline` / `relay`，无子命令等价 `batch` |
 
 ## 行为约定

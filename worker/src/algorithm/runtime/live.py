@@ -1,29 +1,25 @@
-"""Live frame intake: a reader thread feeding a drop-oldest queue.
+"""Live wrapper: pull a :class:`FrameSource` on a reader thread.
 
-A live source can deliver frames faster than the pipeline consumes them.  Blocking
-on the newest frame instead of queueing all of them keeps the stream in real time:
-the reader always overwrites the single slot, and the consumer sees the latest
-frame plus a count of the frames it skipped.
-
-The source accepts an RTSP URL or a local video file.  Files are replayed at their
-own frame rate and loop when they end, so a local clip behaves like a live stream.
+The sources own their lifecycle (``open``/``read``/``close``, reconnection, file
+looping) and never spawn a thread.  This module adds the one policy the live path
+needs: keep only the newest frame.  A pipeline that falls behind therefore drops
+frames instead of accumulating latency, which is what keeps ``relay`` real time.
 """
 
 from __future__ import annotations
 
-import os
 import threading
-from time import monotonic, monotonic_ns, sleep
-from uuid import uuid4
-
-import cv2
-import numpy as np
+from time import monotonic
 
 from algorithm.runtime.frame_packet import FramePacket
+from algorithm.runtime.sources import FrameSource
 
-DEFAULT_FPS = 25.0
 REOPEN_DELAY_S = 1.0
 OPEN_ERROR_LOG_S = 10.0
+# How long to wait before asking the source again while it reports "nothing yet"
+# (an RTSP reconnect in flight).  The source owns the real backoff, so this only
+# has to keep the loop from spinning.
+IDLE_POLL_S = 0.2
 
 
 class LatestFrameQueue:
@@ -34,7 +30,6 @@ class LatestFrameQueue:
         self._packet: FramePacket | None = None
         self._closed = False
         self._dropped = 0
-        self._received = 0
 
     def put_latest(self, packet: FramePacket) -> None:
         with self._condition:
@@ -43,7 +38,6 @@ class LatestFrameQueue:
             if self._packet is not None:
                 self._dropped += 1
             self._packet = packet
-            self._received += 1
             self._condition.notify()
 
     def get(self, timeout: float | None = None) -> FramePacket | None:
@@ -65,64 +59,35 @@ class LatestFrameQueue:
         with self._condition:
             return self._dropped
 
-    @property
-    def received(self) -> int:
-        with self._condition:
-            return self._received
 
-    @property
-    def closed(self) -> bool:
-        with self._condition:
-            return self._closed
-
-
-class LiveSource:
-    """Reader thread over an RTSP URL or a video file.
-
-    Frames are published into :class:`LatestFrameQueue`; timestamps are
-    milliseconds since this source was created and are made strictly increasing,
-    because the trackers reject non-advancing time.  A dropped connection (or the
-    end of a file) reopens the capture after ``reopen_delay_s``.
-    """
+class ThreadedSource:
+    """A :class:`FrameSource` pulled on a thread; the consumer sees the newest frame."""
 
     def __init__(
         self,
-        source: str,
+        source: FrameSource,
         *,
-        rtsp_transport: str = "tcp",
         reopen_delay_s: float = REOPEN_DELAY_S,
+        idle_poll_s: float = IDLE_POLL_S,
     ) -> None:
-        if not isinstance(source, str) or not source.strip():
-            raise ValueError("source must be a non-empty URL or file path")
-        if rtsp_transport not in ("tcp", "udp"):
-            raise ValueError("rtsp_transport must be 'tcp' or 'udp'")
         if reopen_delay_s <= 0.0:
             raise ValueError("reopen_delay_s must be positive")
-        self.source = source.strip()
-        self.rtsp_transport = rtsp_transport
+        if idle_poll_s <= 0.0:
+            raise ValueError("idle_poll_s must be positive")
+        self.source = source
+        self.source_id = source.source_id
         self.reopen_delay_s = reopen_delay_s
+        self.idle_poll_s = idle_poll_s
         self.frames = LatestFrameQueue()
-        self._is_file = "://" not in self.source
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
-        self._started_ns = monotonic_ns()
-        self._session_id = uuid4().hex
-        self._last_timestamp_ms = -1
-        self._frame_index = 0
-        self._fps = DEFAULT_FPS
         self._last_open_error_log = 0.0
 
-    def start(self) -> "LiveSource":
+    def start(self) -> "ThreadedSource":
         if self._thread is not None:
             return self
-        if not self._is_file:
-            # OpenCV reads this when the capture is created, not per frame.
-            os.environ.setdefault(
-                "OPENCV_FFMPEG_CAPTURE_OPTIONS",
-                f"rtsp_transport;{self.rtsp_transport}",
-            )
         self._thread = threading.Thread(
-            target=self._read_loop, name="live-source", daemon=True
+            target=self._read_loop, name="threaded-source", daemon=True
         )
         self._thread.start()
         return self
@@ -138,65 +103,56 @@ class LiveSource:
             self._thread = None
 
     @property
-    def fps(self) -> float:
-        return self._fps
-
-    @property
     def dropped(self) -> int:
         return self.frames.dropped
 
     @property
-    def received(self) -> int:
-        return self.frames.received
+    def fps(self) -> float:
+        """The wrapped source's own frame rate (0.0 when it cannot report one)."""
+        return getattr(self.source, "fps", 0.0)
 
     # -- internals ---------------------------------------------------------
     def _read_loop(self) -> None:
         while not self._stop.is_set():
-            capture = cv2.VideoCapture(self.source)
-            if not capture.isOpened():
-                capture.release()
+            try:
+                self.source.open()
+            except Exception:  # noqa: BLE001 - the source is not reachable yet
                 self._log_open_error()
-                sleep(self.reopen_delay_s)
+                self._stop.wait(self.reopen_delay_s)
                 continue
-            capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-            fps = float(capture.get(cv2.CAP_PROP_FPS))
-            if 0.0 < fps < 240.0:
-                self._fps = fps
-            period = 1.0 / self._fps if self._is_file else 0.0
-            while not self._stop.is_set():
-                started = monotonic()
-                ok, frame = capture.read()
-                if not ok or frame is None:
-                    break
-                self._publish(frame)
-                if period > 0.0:
-                    sleep(max(0.0, period - (monotonic() - started)))
-            capture.release()
+            try:
+                self._pump()
+            finally:
+                self.source.close()
             if not self._stop.is_set():
-                sleep(self.reopen_delay_s)
+                self._stop.wait(self.reopen_delay_s)
 
-    def _publish(self, frame: np.ndarray) -> None:
-        elapsed_ms = int((monotonic_ns() - self._started_ns) // 1_000_000)
-        timestamp_ms = max(self._last_timestamp_ms + 1, elapsed_ms)
-        self._last_timestamp_ms = timestamp_ms
-        height, width = frame.shape[:2]
-        self.frames.put_latest(
-            FramePacket(
-                source_id=self.source,
-                session_id=self._session_id,
-                frame_index=self._frame_index,
-                timestamp_ms=timestamp_ms,
-                received_at_monotonic_ms=elapsed_ms,
-                image=frame,
-                original_width=int(width),
-                original_height=int(height),
-            )
-        )
-        self._frame_index += 1
+    def _pump(self) -> None:
+        while not self._stop.is_set():
+            started = monotonic()
+            packet = self.source.read()
+            if packet is None:
+                # ``None`` means "nothing for me right now".  A finite source (a
+                # file that ran out) sets ``exhausted`` and the loop reopens it;
+                # a live source backing off never sets it and just needs a pause
+                # before the next attempt.
+                if getattr(self.source, "exhausted", False):
+                    return
+                self._stop.wait(self.idle_poll_s)
+                continue
+            self.frames.put_latest(packet)
+            # Pace the reader to the source's own frame rate so a decoder that
+            # runs ahead of real time does not spin; the drop-oldest queue then
+            # absorbs whatever the pipeline cannot keep up with.  A live stream
+            # whose ``read()`` already blocks at the stream's pace collapses
+            # this wait to zero.
+            fps = getattr(self.source, "fps", 0.0)
+            if fps > 0.0:
+                self._stop.wait(max(0.0, (1.0 / fps) - (monotonic() - started)))
 
     def _log_open_error(self) -> None:
         now = monotonic()
         if now - self._last_open_error_log < OPEN_ERROR_LOG_S:
             return
         self._last_open_error_log = now
-        print(f"live-source: cannot open {self.source!r}; retrying", flush=True)
+        print(f"live-source: cannot open {self.source_id!r}; retrying", flush=True)

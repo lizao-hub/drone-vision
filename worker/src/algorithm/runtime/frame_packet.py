@@ -18,7 +18,6 @@ class FramePacket:
     session_id: str
     frame_index: int
     timestamp_ms: int
-    received_at_monotonic_ms: int | None
     image: np.ndarray
     original_width: int
     original_height: int
@@ -33,11 +32,6 @@ class FramePacket:
         ):
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 raise ValueError(f"{name} must be a non-negative integer")
-        if (
-            self.received_at_monotonic_ms is not None
-            and self.received_at_monotonic_ms < 0
-        ):
-            raise ValueError("received_at_monotonic_ms must be non-negative or None")
         if not isinstance(self.image, np.ndarray) or self.image.ndim != 3:
             raise ValueError("image must be an H x W x C ndarray")
         if self.original_width <= 0 or self.original_height <= 0:

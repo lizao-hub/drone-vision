@@ -1,8 +1,13 @@
 """Entry point: ``python -m drone_worker [batch|pipeline|relay] [args]``.
 
-No subcommand means ``batch``, which is also still accepted spelled out because
-existing commands do.  ``relay`` is the live path: RTSP in, annotated RTMP out,
-over the same serial pipeline.
+The three entries share one flag vocabulary (``--source``, ``--device``,
+``--stride``, ``--log-every``, the model overrides) and differ only in topology:
+
+* ``batch``    -- one device, file in, JSONL out (mp4 with ``--save-video``);
+* ``pipeline`` -- ``--device 0,1`` splits segmentation and detection;
+* ``relay``    -- live in, annotated RTMP out.
+
+No subcommand means ``batch``; ``batch`` spelled out is still accepted.
 """
 
 from __future__ import annotations
@@ -14,9 +19,9 @@ from typing import Sequence
 def main(argv: Sequence[str] | None = None) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
     if arguments[:1] == ["pipeline"]:
-        from drone_worker.parallel import main_parallel
+        from drone_worker.pipeline import main_pipeline
 
-        return main_parallel(arguments[1:])
+        return main_pipeline(arguments[1:])
     if arguments[:1] == ["relay"]:
         from drone_worker.relay import main_relay
 

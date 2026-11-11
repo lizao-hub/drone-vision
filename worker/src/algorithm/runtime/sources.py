@@ -1,25 +1,29 @@
 """Frame sources: OpenCV capture in, :class:`FramePacket` out.
 
-Every source implements the same small lifecycle: ``open()`` once, ``read()`` from
-exactly one reader until it stops, ``close()`` after that reader exits.  Sources
-never own a thread, so a controller can decide whether to pull synchronously
-(batch) or wrap the source in a reader thread (see :mod:`algorithm.runtime.live`).
+There are exactly two: ``FileSequenceSource`` for one local video and
+``RtspSource`` for a live feed.  Both implement the same small lifecycle --
+``open()`` once, ``read()`` from exactly one reader until it stops, ``close()``
+after that reader exits -- and neither owns a thread.  A controller therefore
+decides how to pull: synchronously (``batch`` / ``pipeline``) or through a reader
+thread that keeps only the newest frame
+(:class:`algorithm.runtime.live.ThreadedSource`).
 
-``FileSequenceSource`` replays one or more local files as one continuous timeline:
-timestamps keep advancing across file boundaries, realtime pacing prevents a fast
-decode from racing ahead of the pipeline, and ``frame_stride`` marks frames as
-inference-eligible instead of dropping them.  ``RtspSource`` reconnects with
-exponential backoff and reports its connection state; a failed read is not an
-exception but an explicit ``None`` while the backoff is pending.
+``FileSequenceSource`` reads one file and marks sampled frames as
+inference-eligible instead of dropping them, so the timeline stays dense while
+inference runs on a subset.  ``RtspSource`` reconnects with exponential backoff
+and reports its connection state; a failed read is not an exception but an
+explicit ``None`` while the backoff is pending.
 
-``capture_factory`` is injectable so tests can drive both sources with a fake
-capture and no video files.
+``open_capture`` and ``make_packet`` are the two pieces both sources share, so the
+transport policy, the buffer size and the strictly-increasing timestamp exist in
+one place.  ``capture_factory`` stays injectable so tests can drive the sources
+with a fake capture and no video files.
 """
 
 from __future__ import annotations
 
 import os
-from collections.abc import Callable, Sequence
+from collections.abc import Callable
 from pathlib import Path
 from threading import Event
 from time import monotonic, monotonic_ns
@@ -70,47 +74,75 @@ def _strict_timestamp(previous_ms: int | None, candidate_ms: int) -> int:
     return max(candidate_ms, previous_ms + 1)
 
 
+def open_capture(
+    source: str,
+    *,
+    rtsp_transport: str | None = None,
+    capture_factory: CaptureFactory = _default_capture_factory,
+) -> Capture:
+    """Open a capture with the demo's transport and buffer policy.
+
+    The buffer is pinned to one frame: a backlog in the decoder is latency, not
+    content, and every consumer here wants the newest frame.
+    """
+    if rtsp_transport is not None:
+        # OpenCV reads this when the capture is created, not per frame.
+        os.environ.setdefault(
+            "OPENCV_FFMPEG_CAPTURE_OPTIONS",
+            f"rtsp_transport;{rtsp_transport}",
+        )
+    capture = capture_factory(source)
+    capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    return capture
+
+
+def make_packet(
+    *,
+    source_id: str,
+    session_id: str,
+    frame_index: int,
+    timestamp_ms: int,
+    image: np.ndarray,
+    inference_eligible: bool = True,
+) -> FramePacket:
+    """The one place a :class:`FramePacket` is built from a decoded frame."""
+    height, width = image.shape[:2]
+    return FramePacket(
+        source_id=source_id,
+        session_id=session_id,
+        frame_index=frame_index,
+        timestamp_ms=timestamp_ms,
+        image=image,
+        original_width=int(width),
+        original_height=int(height),
+        inference_eligible=inference_eligible,
+    )
+
+
 class FileSequenceSource:
-    """Replay local videos as one strictly-increasing timeline."""
+    """Read one local video as a strictly-increasing frame stream."""
 
     source_id = "file-sequence"
-    pace_to_processing_fps = False
 
     def __init__(
         self,
-        paths: Sequence[Path],
+        path: Path,
         *,
         capture_factory: CaptureFactory = _default_capture_factory,
         session_id: str | None = None,
         frame_stride: int = 1,
-        realtime: bool = True,
-        maximum_lag_ms: int = 120,
-        loop: bool = False,
     ) -> None:
-        if not paths:
-            raise ValueError("at least one file path is required")
         if frame_stride <= 0:
             raise ValueError("frame_stride must be positive")
-        if maximum_lag_ms < 0:
-            raise ValueError("maximum_lag_ms must be non-negative")
-        self.paths = tuple(Path(path) for path in paths)
+        self.path = Path(path)
         self.capture_factory = capture_factory
         self.session_id = session_id or f"file-{uuid4().hex}"
         self.frame_stride = frame_stride
-        self.realtime = realtime
-        self.maximum_lag_ms = maximum_lag_ms
-        self.loop = loop
         self._capture: Capture | None = None
-        self._path_index = -1
         self._frame_index = 0
-        self._offset_ms = 0
         self._last_timestamp_ms: int | None = None
-        self._last_local_timestamp_ms = 0
-        self._opened = False
-        self._playback_started_at: float | None = None
-        self._first_timestamp_ms: int | None = None
-        self._paused_at: float | None = None
         self._stop_requested = Event()
+        self._opened = False
         self._fps = DEFAULT_FPS
         self._width = 0
         self._height = 0
@@ -120,18 +152,12 @@ class FileSequenceSource:
     def open(self) -> None:
         self.close()
         self._stop_requested.clear()
-        self._path_index = -1
         self._frame_index = 0
-        self._offset_ms = 0
         self._last_timestamp_ms = None
-        self._last_local_timestamp_ms = 0
         self.exhausted = False
         self._opened = True
-        self._playback_started_at = monotonic()
-        self._first_timestamp_ms = None
-        self._paused_at = None
         try:
-            self._open_next()
+            self._open_capture()
         except Exception:
             self._opened = False
             raise
@@ -141,56 +167,31 @@ class FileSequenceSource:
             return None
         if not self._opened:
             raise RuntimeError("file source is not open")
-        while self._capture is not None and not self._stop_requested.is_set():
-            ok, image = self._capture.read()
-            if self._stop_requested.is_set():
-                return None
-            if ok and image is not None:
-                local_ms = max(
-                    0,
-                    round(self._capture.get(cv2.CAP_PROP_POS_MSEC)),
-                )
-                self._last_local_timestamp_ms = local_ms
-                frame_index = self._frame_index
-                self._frame_index += 1
-                timestamp_ms = _strict_timestamp(
-                    self._last_timestamp_ms,
-                    self._offset_ms + local_ms,
-                )
-                self._last_timestamp_ms = timestamp_ms
-                if self._first_timestamp_ms is None:
-                    self._first_timestamp_ms = timestamp_ms
-                if self.realtime and self._playback_started_at is not None:
-                    target_elapsed_s = (
-                        timestamp_ms - self._first_timestamp_ms
-                    ) / 1000.0
-                    delay_s = target_elapsed_s - (
-                        monotonic() - self._playback_started_at
-                    )
-                    if delay_s > 0.0:
-                        if self._stop_requested.wait(timeout=delay_s):
-                            return None
-                    elif delay_s < -(self.maximum_lag_ms / 1000.0):
-                        # Decode faster than the pipeline consumes: skip this
-                        # frame instead of baking latency into the stream.
-                        continue
-                height, width = image.shape[:2]
-                return FramePacket(
-                    source_id=self.source_id,
-                    session_id=self.session_id,
-                    frame_index=frame_index,
-                    timestamp_ms=timestamp_ms,
-                    received_at_monotonic_ms=monotonic_ns() // 1_000_000,
-                    image=image,
-                    original_width=width,
-                    original_height=height,
-                    inference_eligible=(frame_index % self.frame_stride == 0),
-                )
-            self._offset_ms += self._current_duration_ms()
-            self._open_next()
-        if not self._stop_requested.is_set():
+        capture = self._capture
+        if capture is None:
             self.exhausted = True
-        return None
+            return None
+        ok, image = capture.read()
+        if self._stop_requested.is_set():
+            return None
+        if not ok or image is None:
+            self.exhausted = True
+            return None
+        timestamp_ms = _strict_timestamp(
+            self._last_timestamp_ms,
+            max(0, round(capture.get(cv2.CAP_PROP_POS_MSEC))),
+        )
+        self._last_timestamp_ms = timestamp_ms
+        frame_index = self._frame_index
+        self._frame_index += 1
+        return make_packet(
+            source_id=self.source_id,
+            session_id=self.session_id,
+            frame_index=frame_index,
+            timestamp_ms=timestamp_ms,
+            image=image,
+            inference_eligible=(frame_index % self.frame_stride == 0),
+        )
 
     def request_stop(self) -> None:
         """Cooperative cancellation only; never touch the native capture here."""
@@ -203,21 +204,6 @@ class FileSequenceSource:
         if capture is not None:
             capture.release()
         self._opened = False
-        self._playback_started_at = None
-        self._paused_at = None
-
-    def pause(self) -> None:
-        if self.realtime and self._paused_at is None:
-            self._paused_at = monotonic()
-
-    def resume(self) -> None:
-        if (
-            self.realtime
-            and self._paused_at is not None
-            and self._playback_started_at is not None
-        ):
-            self._playback_started_at += monotonic() - self._paused_at
-        self._paused_at = None
 
     @property
     def fps(self) -> float:
@@ -233,30 +219,14 @@ class FileSequenceSource:
 
     @property
     def frame_count(self) -> int:
-        """Frames in the current file; the whole sequence may be longer."""
         return self._frame_count
 
-    def _open_next(self) -> None:
-        previous = self._capture
-        self._capture = None
-        if previous is not None:
-            previous.release()
-        self._path_index += 1
-        if self._path_index >= len(self.paths):
-            if not self.loop:
-                self.exhausted = True
-                return
-            self._path_index = 0
-        capture = self.capture_factory(str(self.paths[self._path_index]))
+    def _open_capture(self) -> None:
+        capture = self.capture_factory(str(self.path))
         if not capture.isOpened():
             capture.release()
-            raise RuntimeError(
-                f"cannot open video source: {self.paths[self._path_index]}",
-            )
+            raise RuntimeError(f"cannot open video source: {self.path}")
         self._capture = capture
-        self._read_capture_properties(capture)
-
-    def _read_capture_properties(self, capture: Capture) -> None:
         fps = float(capture.get(cv2.CAP_PROP_FPS))
         if fps > 0.0:
             self._fps = fps
@@ -269,21 +239,11 @@ class FileSequenceSource:
             self._width = width
             self._height = height
 
-    def _current_duration_ms(self) -> int:
-        if self._capture is None:
-            return max(1, self._last_local_timestamp_ms + 1)
-        frame_count = self._capture.get(cv2.CAP_PROP_FRAME_COUNT)
-        fps = self._capture.get(cv2.CAP_PROP_FPS)
-        if frame_count > 0.0 and fps > 0.0:
-            return max(1, round(frame_count / fps * 1000.0))
-        return max(1, self._last_local_timestamp_ms + 1)
-
 
 class RtspSource:
     """Pull a live RTSP stream, reconnecting with exponential backoff."""
 
     source_id = "rtsp"
-    pace_to_processing_fps = True
 
     def __init__(
         self,
@@ -321,38 +281,10 @@ class RtspSource:
         self.connection_state = "closed"
         self.last_error: str | None = None
         self.exhausted = False
-
-    @classmethod
-    def from_env(
-        cls,
-        variable: str,
-        *,
-        capture_factory: CaptureFactory = _default_capture_factory,
-        session_id: str | None = None,
-        reconnect_initial_s: float = 0.5,
-        reconnect_max_s: float = 8.0,
-        rtsp_transport: str | None = "tcp",
-    ) -> RtspSource:
-        url = os.environ.get(variable)
-        if not url:
-            raise ValueError(f"RTSP environment variable is not set: {variable}")
-        return cls(
-            url,
-            capture_factory=capture_factory,
-            session_id=session_id,
-            reconnect_initial_s=reconnect_initial_s,
-            reconnect_max_s=reconnect_max_s,
-            rtsp_transport=rtsp_transport,
-        )
+        self._fps = DEFAULT_FPS
 
     def open(self) -> None:
         self.close()
-        if self.rtsp_transport is not None:
-            # OpenCV reads this when the capture is created, not per frame.
-            os.environ.setdefault(
-                "OPENCV_FFMPEG_CAPTURE_OPTIONS",
-                f"rtsp_transport;{self.rtsp_transport}",
-            )
         self._closed = False
         self.exhausted = False
         self._frame_index = 0
@@ -378,22 +310,24 @@ class RtspSource:
         if not ok or image is None:
             self._mark_disconnected("rtsp_read_failed")
             return None
-        received_ms = monotonic_ns() // 1_000_000
-        timestamp_ms = _strict_timestamp(self._last_timestamp_ms, received_ms)
+        timestamp_ms = _strict_timestamp(
+            self._last_timestamp_ms, monotonic_ns() // 1_000_000
+        )
         self._last_timestamp_ms = timestamp_ms
-        height, width = image.shape[:2]
-        packet = FramePacket(
+        packet = make_packet(
             source_id=self.source_id,
             session_id=self.session_id,
             frame_index=self._frame_index,
             timestamp_ms=timestamp_ms,
-            received_at_monotonic_ms=received_ms,
             image=image,
-            original_width=width,
-            original_height=height,
         )
         self._frame_index += 1
         return packet
+
+    @property
+    def fps(self) -> float:
+        """The stream's own frame rate, or the fallback until the first connect."""
+        return self._fps
 
     def close(self) -> None:
         self._closed = True
@@ -404,14 +338,21 @@ class RtspSource:
             capture.release()
 
     def _connect(self) -> bool:
-        capture = self.capture_factory(self._url)
+        capture = open_capture(
+            self._url,
+            rtsp_transport=self.rtsp_transport,
+            capture_factory=self.capture_factory,
+        )
         if not capture.isOpened():
             capture.release()
             self._schedule_reconnect("rtsp_open_failed")
             return False
-        # Keep only the newest decoded frame; a backlog is latency, not content.
-        capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         self._capture = capture
+        # The relay derives its output rate from this, so a bogus value (0, or
+        # something absurd) must not replace the fallback.
+        fps = float(capture.get(cv2.CAP_PROP_FPS))
+        if 0.0 < fps < 240.0:
+            self._fps = fps
         self.stream_generation += 1
         self.connection_state = "connected"
         self.last_error = None

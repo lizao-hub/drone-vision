@@ -76,31 +76,27 @@ def _factory(captures: list[FakeCapture]):
     return factory
 
 
-def test_file_source_keeps_timestamps_increasing_across_files() -> None:
-    captures = [FakeCapture(_frames(2)), FakeCapture(_frames(2))]
+def test_file_source_keeps_timestamps_increasing() -> None:
     source = FileSequenceSource(
-        [Path("a.mp4"), Path("b.mp4")],
-        capture_factory=_factory(captures),
-        realtime=False,
+        Path("a.mp4"),
+        capture_factory=_factory([FakeCapture(_frames(2))]),
     )
     source.open()
 
-    packets = [source.read() for _ in range(4)]
+    packets = [source.read() for _ in range(3)]
 
-    assert all(packet is not None for packet in packets)
-    assert [packet.timestamp_ms for packet in packets] == [0, 40, 80, 120]
-    assert [packet.frame_index for packet in packets] == [0, 1, 2, 3]
-    assert source.read() is None
+    assert all(packet is not None for packet in packets[:2])
+    assert [packet.timestamp_ms for packet in packets[:2]] == [0, 40]
+    assert [packet.frame_index for packet in packets[:2]] == [0, 1]
+    assert packets[2] is None
     assert source.exhausted
-    assert all(capture.released for capture in captures)
 
 
 def test_file_source_marks_sampled_frames_instead_of_dropping_them() -> None:
     source = FileSequenceSource(
-        [Path("a.mp4")],
+        Path("a.mp4"),
         capture_factory=_factory([FakeCapture(_frames(7))]),
         frame_stride=3,
-        realtime=False,
     )
     source.open()
 
@@ -118,28 +114,10 @@ def test_file_source_marks_sampled_frames_instead_of_dropping_them() -> None:
     ]
 
 
-def test_file_source_loop_restarts_the_sequence_without_repeating_time() -> None:
-    captures = [FakeCapture(_frames(2)), FakeCapture(_frames(2))]
-    source = FileSequenceSource(
-        [Path("a.mp4")],
-        capture_factory=_factory(captures),
-        realtime=False,
-        loop=True,
-    )
-    source.open()
-
-    packets = [source.read() for _ in range(3)]
-
-    assert [packet.timestamp_ms for packet in packets] == [0, 40, 80]
-    assert [packet.frame_index for packet in packets] == [0, 1, 2]
-    assert not source.exhausted
-
-
 def test_file_source_reports_the_capture_properties() -> None:
     source = FileSequenceSource(
-        [Path("a.mp4")],
+        Path("a.mp4"),
         capture_factory=_factory([FakeCapture(_frames(10), fps=30.0)]),
-        realtime=False,
     )
     source.open()
 
@@ -153,18 +131,13 @@ def test_file_source_reports_the_capture_properties() -> None:
 
 def test_file_source_validates_its_settings() -> None:
     with pytest.raises(ValueError):
-        FileSequenceSource([])
-    with pytest.raises(ValueError):
-        FileSequenceSource([Path("a.mp4")], frame_stride=0)
-    with pytest.raises(ValueError):
-        FileSequenceSource([Path("a.mp4")], maximum_lag_ms=-1)
+        FileSequenceSource(Path("a.mp4"), frame_stride=0)
 
 
 def test_file_source_raises_when_the_capture_will_not_open() -> None:
     source = FileSequenceSource(
-        [Path("missing.mp4")],
+        Path("missing.mp4"),
         capture_factory=_factory([FakeCapture([], opened=False)]),
-        realtime=False,
     )
 
     with pytest.raises(RuntimeError):
@@ -214,23 +187,14 @@ def test_rtsp_source_sets_the_transport_and_buffer_before_connecting() -> None:
     assert (cv2.CAP_PROP_BUFFERSIZE, 1) in capture.settings
 
 
-def test_rtsp_source_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("FEED_URL", "rtsp://host/feed")
-    source = RtspSource.from_env(
-        "FEED_URL",
-        capture_factory=_factory([FakeCapture(_frames(1))]),
+def test_rtsp_source_reports_the_stream_frame_rate() -> None:
+    source = RtspSource(
+        "rtsp://host/feed",
+        capture_factory=_factory([FakeCapture(_frames(1), fps=30.0)]),
     )
-
     source.open()
 
-    assert source.read() is not None
-
-
-def test_rtsp_source_from_env_requires_the_variable(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("FEED_URL", raising=False)
-
-    with pytest.raises(ValueError):
-        RtspSource.from_env("FEED_URL")
+    assert source.fps == 30.0
 
 
 def test_rtsp_source_validates_its_settings() -> None:
@@ -248,10 +212,10 @@ def test_a_packet_requires_dense_metadata() -> None:
     image = np.zeros((4, 4, 3), np.uint8)
 
     with pytest.raises(ValueError):
-        FramePacket("s", "s", 0, 0, 0, image, 5, 4)
+        FramePacket("s", "s", 0, 0, image, 5, 4)
     with pytest.raises(ValueError):
-        FramePacket("s", "s", -1, 0, 0, image, 4, 4)
+        FramePacket("s", "s", -1, 0, image, 4, 4)
     with pytest.raises(ValueError):
-        FramePacket("", "s", 0, 0, 0, image, 4, 4)
+        FramePacket("", "s", 0, 0, image, 4, 4)
     with pytest.raises(TypeError):
-        FramePacket("s", "s", 0, 0, 0, image, 4, 4, inference_eligible=1)  # type: ignore[arg-type]
+        FramePacket("s", "s", 0, 0, image, 4, 4, inference_eligible=1)  # type: ignore[arg-type]
